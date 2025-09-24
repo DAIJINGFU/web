@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>本地回测系统</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>
+    :root {
+      --bg:#0f141b;--bg-alt:#161e27;--panel:#1f2732;--panel-alt:#25313f;--border:#2c3a48;--text:#d6dde4;--muted:#7d8b99;--accent:#2f81f7;--accent-grad:linear-gradient(90deg,#2f81f7,#1cb5e0);--danger:#d64545;--success:#29c66f;--warn:#e6a23c;--radius:10px;--code:#0b1016;--mono:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto; background:var(--bg); color:var(--text); display:flex; height:100vh; overflow:hidden; }
+    aside { width:360px; background:var(--bg-alt); border-right:1px solid var(--border); padding:14px 18px 60px; overflow:auto; }
+    main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+    h1 { font-size:20px; letter-spacing:.5px; margin:4px 0 14px; font-weight:600; background:var(--accent-grad); -webkit-background-clip:text; color:transparent; }
+    h2.section { margin:24px 0 8px; font-size:15px; font-weight:600; text-transform:uppercase; letter-spacing:1px; color:#97a6b5; }
+    label { font-size:12px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); display:block; margin:14px 0 4px; }
+    input, textarea { background:var(--panel); border:1px solid var(--border); color:var(--text); width:100%; border-radius:6px; padding:8px 10px; font-size:13px; font-family:inherit; }
+    textarea { min-height:220px; font-family:var(--mono); line-height:1.4; resize:vertical; }
+    button { cursor:pointer; border:none; background:var(--accent-grad); color:#fff; padding:10px 18px; font-size:14px; font-weight:600; border-radius:6px; margin-top:16px; width:100%; box-shadow:0 2px 6px rgba(0,0,0,.4); transition:.25s; }
+    button:disabled { filter:grayscale(.6) brightness(.7); cursor:not-allowed; }
+    button:hover:not(:disabled) { transform:translateY(-2px); box-shadow:0 4px 12px rgba(0,0,0,.55); }
+    small.helper { color:var(--muted); font-size:11px; display:block; margin-top:4px; line-height:1.3; }
+    .pill { display:inline-block; padding:4px 10px; border-radius:999px; background:#243344; font-size:11px; margin-right:6px; }
+    /* Layout areas */
+    .top-kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin:8px 0 14px; }
+    .kpi { background:var(--panel); padding:10px 12px; border:1px solid var(--border); border-radius:var(--radius); position:relative; overflow:hidden; }
+    .kpi h3 { margin:0 0 4px; font-size:11px; font-weight:500; letter-spacing:.5px; color:var(--muted); text-transform:uppercase; }
+    .kpi .val { font-size:20px; font-weight:600; line-height:1; }
+    .kpi.positive .val { color:var(--success); }
+    .kpi.negative .val { color:var(--danger); }
+    .panels { flex:1; overflow:auto; padding:0 18px 40px; }
+    .panel { background:var(--panel-alt); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px 10px; margin-bottom:18px; }
+    .panel h3 { margin:0 0 10px; font-size:14px; font-weight:600; letter-spacing:.5px; }
+    #chartsGrid { display:grid; grid-template-columns:1.4fr 1fr; grid-template-rows:340px 240px 240px; gap:14px; }
+    .chart { width:100%; height:100%; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th, td { padding:4px 6px; border-bottom:1px solid #2e3d4c; text-align:right; white-space:nowrap; }
+    th { text-align:right; font-weight:500; color:#8fa0b2; }
+    td:first-child, th:first-child { text-align:left; }
+    tbody tr:hover { background:#203040; }
+    #log, #jqLogs, #jqRecords { font-family:var(--mono); font-size:11px; background:var(--code); border:1px solid #18232f; border-radius:6px; padding:8px 10px; line-height:1.35; max-height:200px; overflow:auto; }
+    #statusBar { margin-top:10px; font-size:12px; font-weight:500; letter-spacing:.5px; }
+    .status-running { color:var(--accent); }
+    .status-error { color:var(--danger); }
+    .flex-row { display:flex; gap:14px; }
+    .grow { flex:1; }
+    .badge { background:#233242; padding:2px 6px; border-radius:4px; font-size:10px; margin-left:6px; }
+    .split-2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    footer { text-align:center; font-size:11px; color:var(--muted); padding:14px 0 30px; }
+    a { color:#5ea3ff; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    @media (max-width:1380px) { #chartsGrid { grid-template-columns:1fr; grid-template-rows:320px 240px 240px 240px 240px; } }
+    @media (max-width:980px) { body { flex-direction:column; } aside { width:100%; height:auto; border-right:none; border-bottom:1px solid var(--border); } main { height:auto; } }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>本地回测系统</h1>
+    <h2 class="section">回测参数</h2>
+  <!-- 标的输入移除：改为自动从策略代码解析 g.security (或 g.security 列表) -->
+  <input id="symbol" value="sample" style="display:none" />
+  <label>解析到的标的 (只读, 来自 g.security)</label>
+  <div id="parsedSymbols" style="min-height:28px;display:flex;flex-wrap:wrap;gap:6px;"></div>
+  <small class="helper">在策略代码里设置 g.security / g.security=[...] 会自动解析成数据文件名 (XXXX_daily)。</small>
+  <label style="margin-top:10px;">开始日期</label>
+    <input id="start" type="date" value="2025-01-01" />
+    <label>结束日期</label>
+    <input id="end" type="date" value="2025-03-01" />
+    <label>基准 (可选)</label>
+    <input id="benchmark" placeholder="例如: 000300_日" />
+    <label>初始资金</label>
+    <input id="cash" type="number" value="100000" />
+    <label>策略代码 (UserStrategy 或 initialize/handle_data)</label>
+    <textarea id="code" spellcheck="false">import backtrader as bt
+class UserStrategy(bt.Strategy):
+    params = dict(fast=5, slow=20)
+    def __init__(self):
+        self.fast = bt.ind.SMA(self.data, period=self.p.fast)
+        self.slow = bt.ind.SMA(self.data, period=self.p.slow)
+    def next(self):
+        if not self.position and self.fast[0] > self.slow[0]:
+            self.buy()
+        elif self.position and self.fast[0] < self.slow[0]:
+            self.close()
+</textarea>
+    <button id="runBtn" onclick="runBacktest()">▶ 运行回测</button>
+    <div id="statusBar"></div>
+    <small class="helper">支持 JoinQuant 风格 initialize/handle_data；多标的用逗号或在 g.security 列表设置。</small>
+  </aside>
+  <main>
+    <div class="panels">
+      <div class="panel" id="kpiPanel">
+        <h3>关键指标 <span class="badge" id="periodBadge"></span></h3>
+        <div class="top-kpis" id="metrics"></div>
+      </div>
+      <div class="panel">
+        <h3>图表分析</h3>
+        <div id="chartsGrid">
+          <div id="equityChart" class="chart"></div>
+          <div id="drawdownChart" class="chart"></div>
+          <div id="dailyReturnChart" class="chart"></div>
+          <div id="benchmarkChart" class="chart"></div>
+          <div id="excessChart" class="chart"></div>
+        </div>
+      </div>
+      <div class="panel split-2">
+        <div>
+          <h3>交易记录 <span class="badge" id="tradeCount"></span></h3>
+          <div style="max-height:260px; overflow:auto;">
+            <table id="tradesTable">
+              <thead><tr><th>日期</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>佣金</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>日志 / 错误</h3>
+          <div id="log"></div>
+          <h3 style="margin-top:18px;">JQ Logs</h3>
+          <div id="jqLogs"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Record 记录 (近 200)</h3>
+        <div id="jqRecords" style="max-height:220px; overflow:auto;"></div>
+      </div>
+      <footer>本页面纯静态 HTML + ECharts · 数据由 FastAPI /backtest 返回 · © 2025</footer>
+    </div>
+  </main>
+  <script>
+    const runBtn = document.getElementById('runBtn');
+    const statusBar = document.getElementById('statusBar');
+    function setStatus(msg, cls='') { statusBar.textContent = msg; statusBar.className = cls; }
+
+    function extractSymbolsFromCode(code){
+      // 支持 g.security = '000516.XSHE' 或 g.security=['000001.XSHE','000002.XSHE']
+      // 也支持 g.security = '000516_daily'
+      const singleRe = /g\.security\s*=\s*['"]([^'"\n]+)['"]/i;
+      const listRe = /g\.security\s*=\s*\[([^\]]+)\]/i;
+      let syms = [];
+      const listMatch = code.match(listRe);
+      if(listMatch){
+        const parts = listMatch[1].split(/[,\n]/).map(s=>s.trim()).filter(Boolean);
+        parts.forEach(p=>{ const m=p.match(/['"]([^'"]+)['"]/); if(m) syms.push(m[1]); });
+      } else {
+        const m = code.match(singleRe);
+        if(m) syms.push(m[1]);
+      }
+      // 转换 000001.XSHE -> 000001_daily 与 .XSHG 同理
+      syms = syms.map(s=>{
+        if(/\.xshe$/i.test(s) || /\.xshg$/i.test(s)) return s.split('.')[0] + '_daily';
+        return s;
+      });
+      return syms;
+    }
+
+    function renderParsedSymbols(list){
+      const box = document.getElementById('parsedSymbols');
+      box.innerHTML = '';
+      if(!list.length){
+        const span = document.createElement('span');
+        span.className = 'pill';
+        span.style.opacity = .55;
+        span.textContent = '未解析到 (使用旧 symbol 或未设 g.security)';
+        box.appendChild(span);
+        return;
+      }
+      list.forEach(s=>{
+        const span = document.createElement('span');
+        span.className = 'pill';
+        span.textContent = s;
+        box.appendChild(span);
+      });
+    }
+
+    // 初次与输入时解析显示
+    const codeTextarea = document.getElementById('code');
+    function refreshParsed(){
+      const list = extractSymbolsFromCode(codeTextarea.value);
+      renderParsedSymbols(list);
+    }
+    codeTextarea.addEventListener('input', ()=>{
+      // 去抖可选; 这里直接刷新
+      refreshParsed();
+    });
+    document.addEventListener('DOMContentLoaded', refreshParsed);
+
+    async function runBacktest() {
+      if(runBtn.disabled) return;
+      setStatus('正在运行回测...', 'status-running');
+      runBtn.disabled = true; runBtn.textContent = '运行中...';
+  const code = document.getElementById('code').value;
+  const extracted = extractSymbolsFromCode(code);
+  renderParsedSymbols(extracted); // 运行前再次刷新
+      const payload = {
+        symbol: extracted.join(',') || document.getElementById('symbol').value.trim(),
+        start: document.getElementById('start').value,
+        end: document.getElementById('end').value,
+        cash: parseFloat(document.getElementById('cash').value),
+        strategy_code: code,
+        benchmark_symbol: document.getElementById('benchmark').value.trim() || null,
+      };
+      if(!extracted.length){
+        // 给用户提示仍可兼容旧写法
+        console.log('未从代码中解析到 g.security, 使用隐藏 symbol 字段 fallback');
+      }
+      try {
+        const res = await fetch('/api/backtest', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+        const data = await res.json();
+        window.lastResult = data;
+        if(data.metrics && !data.metrics.error) {
+          setStatus('完成', '');
+          renderResult(data);
+        } else {
+          throw new Error('回测失败\n' + (data.log||''));
+        }
+      } catch(err) {
+        console.error(err); setStatus('错误: ' + err.message, 'status-error');
+        document.getElementById('log').textContent = err.stack || err.message;
+      } finally { runBtn.disabled = false; runBtn.textContent = '▶ 运行回测'; }
+    }
+
+    function formatMetricValue(k, v){
+      if(v === null || v === undefined) return '-';
+      if(typeof v === 'number') {
+        if(['final_value'].includes(k)) return v.toFixed(2);
+        if(/(pct|rate|return|win|sharpe|drawdown|excess|rt_annual|rnorm100)/i.test(k)) {
+          // raw ratio display as % if in -5..5
+            if(Math.abs(v) < 5) return (v*100).toFixed(2)+'%';
+        }
+        return v.toFixed(3);
+      }
+      return v;
+    }
+
+    function renderKPIs(metrics){
+      const order = [
+        ['pnl_pct','策略收益'], ['benchmark_final','基准终值'], ['excess_return','超额收益'], ['rt_annual','年化'],
+        ['sharpe','夏普'], ['max_drawdown','最大回撤'], ['win_rate','胜率'], ['total_trades','总交易'], ['rnorm100','rnorm100'], ['drawdown_len','回撤天数']
+      ];
+      const wrap = document.getElementById('metrics'); wrap.innerHTML='';
+      order.forEach(([k,label])=>{
+        if(!(k in metrics)) return;
+        const v = metrics[k];
+        const box = document.createElement('div');
+        box.className = 'kpi';
+        const classMod = (typeof v==='number' && ['pnl_pct','excess_return','rt_annual','win_rate','sharpe'].includes(k)) ? (v>=0?' positive':' negative') : '';
+        box.className += classMod;
+        box.innerHTML = `<h3>${label}</h3><div class="val">${formatMetricValue(k,v)}</div>`;
+        wrap.appendChild(box);
+      });
+    }
+
+    function computeDrawdown(equity){
+      let peak = -Infinity; const series = [];
+      for(const p of equity){
+        if(p.equity > peak) peak = p.equity;
+        const dd = peak === 0 ? 0 : (p.equity/peak - 1);
+        series.push({date:p.date, dd});
+      }
+      return series; // dd <= 0
+    }
+
+    function drawCharts(equity, returns, benchmark, excess){
+      const theme = { textStyle:{ color:'#b9c4cc' }, tooltip:{ trigger:'axis' }, grid:{left:50,right:20,top:40,bottom:40} };
+      const dates = equity.map(x=>x.date);
+      // Equity & benchmark
+      const eqChart = echarts.init(document.getElementById('equityChart'));
+      eqChart.setOption({ ...theme, title:{text:'权益曲线', left:10}, legend:{data:['策略','基准'], top:4, textStyle:{color:'#9fb0bd'}}, xAxis:{type:'category', data:dates}, yAxis:{type:'value'}, series:[
+        {name:'策略', type:'line', smooth:true, showSymbol:false, data:equity.map(x=>x.equity), lineStyle:{width:1.8}},
+        ...(benchmark?.length? [{name:'基准', type:'line', smooth:true, showSymbol:false, data:benchmark.map(x=>x.equity), lineStyle:{width:1, type:'dashed'}}]: [])
+      ]});
+      // Drawdown
+      const ddSeries = computeDrawdown(equity);
+      const ddChart = echarts.init(document.getElementById('drawdownChart'));
+      ddChart.setOption({ ...theme, title:{text:'回撤(%)', left:10}, xAxis:{type:'category', data:dates}, yAxis:{type:'value', axisLabel:{formatter:v=> (v*100).toFixed(0)}}, series:[{ type:'bar', data:ddSeries.map(x=> (x.dd*100).toFixed(2)), itemStyle:{color:'#d64545'} }] });
+      // Daily returns
+      const drChart = echarts.init(document.getElementById('dailyReturnChart'));
+      drChart.setOption({ ...theme, title:{text:'日收益(%)', left:10}, xAxis:{type:'category', data:returns.map(x=>x.date)}, yAxis:{type:'value'}, series:[{ type:'bar', data:returns.map(x=> (x.ret*100).toFixed(2)), itemStyle:{color:params=> params.value>=0? '#29c66f':'#d64545'} }] });
+      // Benchmark vs strategy already covered in first; reuse for excess & cum excess
+      const bmChart = echarts.init(document.getElementById('benchmarkChart'));
+      bmChart.setOption({ ...theme, title:{text:'策略 vs 基准(归一化)', left:10}, xAxis:{type:'category', data:dates}, yAxis:{type:'value'}, legend:{data:['策略','基准']}, series:[{name:'策略', type:'line', data:equity.map(x=>x.equity), smooth:true, showSymbol:false}, ...(benchmark?.length? [{name:'基准', type:'line', data:benchmark.map(x=>x.equity), smooth:true, showSymbol:false}]:[])] });
+      const exChart = echarts.init(document.getElementById('excessChart'));
+      exChart.setOption({ ...theme, title:{text:'超额累计(%)', left:10}, xAxis:{type:'category', data:excess.map(x=>x.date)}, yAxis:{type:'value'}, series:[{type:'line', data:excess.map(x=> (x.excess*100).toFixed(2)), smooth:true, showSymbol:false, areaStyle:{opacity:.15}}] });
+      window.addEventListener('resize', ()=>{ eqChart.resize(); ddChart.resize(); drChart.resize(); bmChart.resize(); exChart.resize(); });
+    }
+
+    function renderTrades(trades){
+      const tb = document.querySelector('#tradesTable tbody'); tb.innerHTML='';
+      trades.forEach(t=>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${t.datetime||''}</td><td>${t.side}</td><td>${t.size}</td><td>${(+t.price).toFixed(2)}</td><td>${(+t.value).toFixed(2)}</td><td>${(+t.commission).toFixed(2)}</td>`;
+        tb.appendChild(tr);
+      });
+      document.getElementById('tradeCount').textContent = trades.length + ' 笔';
+    }
+
+    function renderRecords(records){
+      const box = document.getElementById('jqRecords');
+      box.innerHTML = '';
+      (records||[]).slice(-200).forEach(r=>{
+        const div = document.createElement('div');
+        div.textContent = JSON.stringify(r);
+        box.appendChild(div);
+      });
+    }
+
+    function renderResult(data){
+      renderKPIs(data.metrics||{});
+      document.getElementById('log').textContent = data.log || '';
+      document.getElementById('jqLogs').textContent = (data.jq_logs||[]).join('\n');
+      renderRecords(data.jq_records||[]);
+      drawCharts(data.equity_curve||[], data.daily_returns||[], data.benchmark_curve||[], data.excess_curve||[]);
+      renderTrades(data.trades||[]);
+      if(data.equity_curve?.length){
+        const start = data.equity_curve[0].date, end = data.equity_curve[data.equity_curve.length-1].date;
+        document.getElementById('periodBadge').textContent = start + ' ~ ' + end;
+      } else document.getElementById('periodBadge').textContent='';
+    }
+  </script>
+</body>
+</html>
