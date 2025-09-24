@@ -70,12 +70,22 @@ def load_csv_data(symbol: str, start: str, end: str, datadir: str = 'data') -> b
 
 @dataclass
 class TradeRecord:
+    # 保留原字段 (兼容前端) —— datetime 代表平仓日期/或最后事件日期
     datetime: str
-    side: str
-    size: float
-    price: float
-    value: float
+    side: str              # LONG / SHORT
+    size: float            # 开仓手数(股数)
+    price: float           # 兼容字段: 使用平仓价格(exit_price)
+    value: float           # 兼容字段: 使用平仓市值(exit_value)
     commission: float
+    # 新增更细字段
+    open_datetime: str | None = None
+    close_datetime: str | None = None
+    entry_price: float | None = None
+    exit_price: float | None = None
+    entry_value: float | None = None
+    exit_value: float | None = None
+    pnl: float | None = None
+    pnl_comm: float | None = None
 
 @dataclass
 class BacktestResult:
@@ -162,6 +172,7 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
 
     def set_option(name: str, value: Any):
         jq_state['options'][name] = value
+        jq_state['log'].append(f"[set_option] {name}={value}")
 
     def record(**kwargs):
         jq_state['records'].append({'dt': None, **kwargs})
@@ -266,8 +277,22 @@ def compile_user_strategy(code: str):
                     return _pd.DataFrame(data_dict, index=idx)
 
                 def order_value(security: str, value: float):
-                    price = self.data.close[0]
-                    size = int(value / price)
+                    # 根据聚宽选项 use_real_price 决定使用本 bar 收盘价(真实价) 还是开盘价近似下一bar成交
+                    _use_real = exec_env['jq_state']['options'].get('use_real_price') if 'jq_state' in exec_env else False
+                    # 若数据无 open 列则回退 close
+                    chosen_price = None
+                    if _use_real:
+                        # 真实价：当前 bar close，并依赖 broker cheat-on-close 以便本 bar 内成交
+                        chosen_price = getattr(self.data, 'close')[0]
+                    else:
+                        # 模拟 next bar 成交：使用当前 open 作为近似（简化）
+                        if hasattr(self.data, 'open'):
+                            chosen_price = self.data.open[0]
+                        else:
+                            chosen_price = self.data.close[0]
+                    if chosen_price <= 0:
+                        return
+                    size = int(value / chosen_price)
                     if size > 0:
                         self.buy(size=size)
 
@@ -317,81 +342,211 @@ def run_backtest(
 ) -> BacktestResult:
     log_buffer = io.StringIO()
     try:
+        # 1. 编译策略 & 初始化 Cerebro
         StrategyCls, jq_state = compile_user_strategy(strategy_code)
         cerebro = bt.Cerebro()
         cerebro.broker.setcash(cash)
-        # 基础佣金/滑点将于策略添加后设置
 
-        # ------------------ 标的解析逻辑 ------------------
-        # 允许三种来源优先级:
-        # 1. 聚宽风格 g.security (str 或 list)
-        # 2. 表单传入 symbol (逗号分隔)
-        # 3. 默认 fallback 单一 symbol
-        def _jq_code_to_filename(code: str) -> str:
-            """将聚宽证券代码转换为本地 CSV 文件名。
-            规则: 000001.XSHE -> 000001_daily (简化) ; 000001.XSHG -> 000001_daily
-            若已包含 _daily / _日 等后缀则保持原样。
-            """
+        # 2. 标的解析与数据加载
+        def _normalize_existing(name: str) -> str:
+            base_lower = name.lower()
+            patterns = [
+                ('_daily_qfq_daily', '_daily_qfq'),
+                ('_daily_hfq_daily', '_daily_hfq'),
+                ('_日_qfq_日', '_日_qfq'),
+                ('_日_hfq_日', '_日_hfq'),
+                ('_daily_daily', '_daily'),
+            ]
+            for old, new in patterns:
+                if base_lower.endswith(old):
+                    return name[: -len(old)] + new
+            return name
+
+        preserved_suffixes = ('_daily', '_daily_qfq', '_daily_hfq', '_qfq', '_hfq', '_日', '_日_qfq', '_日_hfq')
+
+        def _map_security_code(code: str) -> str:
             c = code.strip()
             lower = c.lower()
-            # 已经是内部文件命名风格
-            if lower.endswith('_daily') or lower.endswith('_日'):  # 兼容 _日
-                return c.replace('.XSHE', '').replace('.XSHG', '')
+            if any(lower.endswith(suf) for suf in preserved_suffixes):
+                return _normalize_existing(c.replace('.XSHE', '').replace('.XSHG', ''))
             if '.xshe' in lower or '.xshg' in lower:
                 base = c.split('.')[0]
-                return f"{base}_daily"
-            return c  # 原样返回, 例如用户直接写文件名
+                candidates = [f"{base}_daily_qfq", f"{base}_daily", f"{base}_日"]
+                for fn in candidates:
+                    if os.path.exists(os.path.join(datadir, fn + '.csv')):
+                        return fn
+                return candidates[0]
+            return c
+
+        def _map_benchmark_code(code: str) -> str:
+            c = code.strip()
+            lower = c.lower()
+            if any(lower.endswith(suf) for suf in preserved_suffixes):
+                return _normalize_existing(c.replace('.XSHE', '').replace('.XSHG', ''))
+            if '.xshe' in lower or '.xshg' in lower:
+                base = c.split('.')[0]
+                candidates = [f"{base}_日", f"{base}_daily", f"{base}_daily_qfq"]
+                for fn in candidates:
+                    if os.path.exists(os.path.join(datadir, fn + '.csv')):
+                        return fn
+                return candidates[0]
+            return c
 
         symbols: List[str] = []
-        g_sec = getattr(jq_state.get('g'), 'security', None) if 'jq_state' in locals() else None
+        g_sec = getattr(jq_state.get('g'), 'security', None)
         if g_sec:
             if isinstance(g_sec, (list, tuple)):
-                symbols = [_jq_code_to_filename(s) for s in g_sec if str(s).strip()]
+                symbols = [_map_security_code(s) for s in g_sec if str(s).strip()]
             elif isinstance(g_sec, str):
-                symbols = [_jq_code_to_filename(g_sec)]
-
-        if not symbols:  # 回退到表单 symbol
+                symbols = [_map_security_code(g_sec)]
+        if not symbols:
             if isinstance(symbol, str):
                 symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             else:
                 symbols = list(symbol)
-
-        # 防止重复
-        symbols = list(dict.fromkeys(symbols))
+        symbols = list(dict.fromkeys(symbols))  # 去重保持顺序
         if not symbols:
             raise ValueError('未指定任何标的: 请在策略 g.security 或 表单 symbol 提供至少一个')
 
-        # 若需要也对 benchmark_symbol 做同样转换 (允许用户输入 000300.XSHG)
         if benchmark_symbol:
-            benchmark_symbol = _jq_code_to_filename(benchmark_symbol)
-        data_feeds = []
-        for idx, sym in enumerate(symbols):
+            benchmark_symbol = _map_benchmark_code(benchmark_symbol)
+
+        for sym in symbols:
             dfeed = load_csv_data(sym, start, end, datadir)
             cerebro.adddata(dfeed, name=sym)
-            data_feeds.append(sym)
 
-        # 策略
+        # 3. 处理聚宽 set_option 影响 (commission / slippage / use_real_price)
         strategy_params = strategy_params or {}
-        cerebro.addstrategy(StrategyCls, **strategy_params)
-        # 佣金 & 滑点 (聚宽兼容 set_option)
-        commission = jq_state.get('options', {}).get('commission') if 'jq_state' in locals() else None
+        commission = jq_state.get('options', {}).get('commission')
         if commission is not None:
             cerebro.broker.setcommission(commission=commission)
-        slippage_perc = jq_state.get('options', {}).get('slippage_perc') if 'jq_state' in locals() else None
+        slippage_perc = jq_state.get('options', {}).get('slippage_perc')
         if slippage_perc is not None:
-            cerebro.broker.set_slippage_perc(perc=slippage_perc)
+            try:
+                cerebro.broker.set_slippage_perc(perc=slippage_perc)
+            except Exception:
+                pass
+        use_real_price_opt = jq_state.get('options', {}).get('use_real_price', False)
+        if use_real_price_opt:
+            try:
+                cerebro.broker.set_coc(True)
+            except Exception:
+                pass
 
-        # analyzers
+        # 4. 定义 TradeCapture Analyzer (捕获已平仓 & 未平仓)
+        class TradeCapture(bt.Analyzer):
+            def start(self):
+                self.records: List[TradeRecord] = []
+                self._open_cache: dict[int, TradeRecord] = {}
+
+            def _fmt_date(self, num_dt):
+                try:
+                    return bt.num2date(num_dt).date().isoformat() if num_dt else None
+                except Exception:
+                    return None
+
+            def notify_trade(self, trade):
+                # 开仓记录/占位
+                if trade.isopen and not trade.isclosed:
+                    tid = id(trade)
+                    if tid not in self._open_cache:
+                        open_dt = self._fmt_date(getattr(trade, 'dtopen', None))
+                        entry_price = getattr(trade, 'price', None) or getattr(trade, 'openprice', None)
+                        size_raw = getattr(trade, 'size', 0)
+                        size_hist = 0
+                        hist = getattr(trade, 'history', None)
+                        if hist:
+                            try:
+                                size_hist = abs(hist[0].event.size)
+                            except Exception:
+                                size_hist = 0
+                        size = abs(size_raw) or size_hist
+                        side = 'LONG' if size_raw > 0 else 'SHORT'
+                        self._open_cache[tid] = TradeRecord(
+                            datetime=open_dt or '',
+                            side=side,
+                            size=size,
+                            price=entry_price or 0.0,
+                            value=(entry_price * size) if entry_price else 0.0,
+                            commission=getattr(trade, 'commission', 0.0),
+                            open_datetime=open_dt,
+                            close_datetime=None,
+                            entry_price=entry_price,
+                            exit_price=None,
+                            entry_value=(entry_price * size) if entry_price else None,
+                            exit_value=None,
+                            pnl=None,
+                            pnl_comm=None,
+                        )
+                    return
+                # 未平仓继续
+                if not trade.isclosed:
+                    return
+                # 平仓
+                open_dt = self._fmt_date(getattr(trade, 'dtopen', None))
+                close_dt = self._fmt_date(getattr(trade, 'dtclose', None))
+                entry_price = None
+                exit_price = None
+                entry_size = 0
+                hist = getattr(trade, 'history', None)
+                try:
+                    if hist:
+                        first_ev = hist[0].event
+                        last_ev = hist[-1].event
+                        entry_price = getattr(first_ev, 'price', None)
+                        exit_price = getattr(last_ev, 'price', None)
+                        entry_size = getattr(first_ev, 'size', 0)
+                except Exception:
+                    pass
+                size = abs(entry_size)
+                side = 'LONG' if entry_size > 0 else 'SHORT'
+                entry_value = (entry_price * size) if (entry_price is not None) else None
+                exit_value = (exit_price * size) if (exit_price is not None) else None
+                pnl = getattr(trade, 'pnl', None)
+                pnl_comm = getattr(trade, 'pnlcomm', None)
+                comm = getattr(trade, 'commission', 0.0)
+                rec = TradeRecord(
+                    datetime=close_dt or open_dt or '',
+                    side=side,
+                    size=size,
+                    price=exit_price or 0.0,
+                    value=exit_value or 0.0,
+                    commission=comm,
+                    open_datetime=open_dt,
+                    close_datetime=close_dt,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    entry_value=entry_value,
+                    exit_value=exit_value,
+                    pnl=pnl,
+                    pnl_comm=pnl_comm,
+                )
+                self._open_cache.pop(id(trade), None)
+                self.records.append(rec)
+
+            def stop(self):
+                for rec in self._open_cache.values():
+                    self.records.append(rec)
+                self._open_cache.clear()
+
+            def get_analysis(self):
+                return self.records
+
+        # 5. 注册 analyzers
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
+        cerebro.addanalyzer(TradeCapture, _name='trade_capture')
+
+        # 6. 添加策略并运行
+        cerebro.addstrategy(StrategyCls, **strategy_params)
         results = cerebro.run()
         strat = results[0]
 
         # 指标汇总
-        sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', None)
+        sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio') if hasattr(strat.analyzers, 'sharpe') else None
         dd = strat.analyzers.drawdown.get_analysis()
         returns = strat.analyzers.returns.get_analysis()
         trade_ana = strat.analyzers.trades.get_analysis()
@@ -427,64 +582,86 @@ def run_backtest(
             'win_rate': win_rate,
             'won_trades': won,
             'lost_trades': lost,
+            'symbols_used': symbols,
+            'use_real_price': bool(use_real_price_opt),
+            'jq_options': jq_state.get('options', {}) if 'jq_state' in locals() else {},
         }
 
         # 基准 & 超额
         benchmark_curve: List[Dict[str, Any]] = []
         excess_curve: List[Dict[str, Any]] = []
+        # 若未显式提供 benchmark_symbol, 现在(策略 initialize 已执行完)再读取 jq_state 里的 benchmark
+        if not benchmark_symbol:
+            jq_bm_post = jq_state.get('benchmark') if 'jq_state' in locals() else None
+            if jq_bm_post:
+                benchmark_symbol = _map_benchmark_code(jq_bm_post)
+                metrics['benchmark_detect_phase'] = 'post_run_initialize'
+            else:
+                # 默认基准回退: 若无 set_benchmark 且未传入, 尝试使用 000300_日.csv
+                default_bm = '000300_日'
+                default_path = os.path.join(datadir, default_bm + '.csv')
+                if os.path.exists(default_path):
+                    benchmark_symbol = default_bm
+                    metrics['benchmark_detect_phase'] = 'fallback_default'
+                    metrics['benchmark_fallback'] = True
+                else:
+                    metrics['benchmark_fallback'] = False
+        else:
+            metrics['benchmark_detect_phase'] = 'pre_run_explicit'
+
         if benchmark_symbol:
             bench_df = load_csv_dataframe(benchmark_symbol, start, end, datadir)
-            bench_df = bench_df[['datetime', 'close']].copy()
-            bench_df['ret'] = bench_df['close'].pct_change().fillna(0.0)
-            bench_df['equity'] = (1 + bench_df['ret']).cumprod()
-            bm_map = {d.strftime('%Y-%m-%d'): (r, eq) for d, r, eq in zip(bench_df['datetime'], bench_df['ret'], bench_df['equity'])}
-            for ec in equity_curve:
-                d = ec['date']
-                if d in bm_map:
-                    br, beq = bm_map[d]
-                    benchmark_curve.append({'date': d, 'equity': beq})
-                    excess_curve.append({'date': d, 'excess': ec['equity']/beq - 1 if beq != 0 else 0})
-            if benchmark_curve:
-                metrics['benchmark_final'] = benchmark_curve[-1]['equity']
-                metrics['excess_return'] = equity_curve[-1]['equity']/benchmark_curve[-1]['equity'] - 1
-            else:
+            if len(bench_df) == 0:
                 metrics['benchmark_final'] = None
                 metrics['excess_return'] = None
+                metrics['benchmark_missing_reason'] = 'empty_file_or_no_rows_in_range'
+            else:
+                # 需要 close 列
+                bench_df = bench_df[['datetime', 'close']].copy()
+                bench_df['ret'] = bench_df['close'].pct_change().fillna(0.0)
+                bench_df['equity'] = (1 + bench_df['ret']).cumprod()
+                bm_map = {d.strftime('%Y-%m-%d'): (r, eq) for d, r, eq in zip(bench_df['datetime'], bench_df['ret'], bench_df['equity'])}
+                overlap_cnt = 0
+                for ec in equity_curve:
+                    d = ec['date']
+                    if d in bm_map:
+                        br, beq = bm_map[d]
+                        benchmark_curve.append({'date': d, 'equity': beq})
+                        excess_curve.append({'date': d, 'excess': ec['equity']/beq - 1 if beq != 0 else 0})
+                        overlap_cnt += 1
+                if benchmark_curve:
+                    metrics['benchmark_final'] = benchmark_curve[-1]['equity']
+                    metrics['excess_return'] = equity_curve[-1]['equity']/benchmark_curve[-1]['equity'] - 1
+                else:
+                    metrics['benchmark_final'] = None
+                    metrics['excess_return'] = None
+                    # 诊断：无日期重叠
+                    metrics['benchmark_missing_reason'] = 'no_overlap_with_strategy_dates'
         else:
             metrics['benchmark_final'] = None
             metrics['excess_return'] = None
 
-        # 简化: 不逐笔构造 trades 列表 (需要 broker observers/notify) 这里只返回聚合
-        # 交易记录: 使用 notify_trade 捕获
-        trade_records: List[TradeRecord] = []
+        # 记录使用的基准信息
+        metrics['benchmark_symbol_used'] = benchmark_symbol
+        metrics['benchmark_code'] = jq_state.get('benchmark') if 'jq_state' in locals() else None
+        if 'benchmark_detect_phase' not in metrics:
+            metrics['benchmark_detect_phase'] = 'none'
 
-        class _TradeRecorder(bt.Strategy):
-            def notify_trade(self, trade):
-                if trade.isclosed:
-                    trade_records.append(TradeRecord(
-                        datetime=str(self.data.datetime.date(0)),
-                        side='LONG' if trade.history[0].event.size > 0 else 'SHORT',
-                        size=trade.history[0].event.size,
-                        price=trade.price,
-                        value=trade.value,
-                        commission=trade.commission,
-                    ))
+        # 回测结束，从 analyzer 里取交易记录 (包含已平仓 + 未平仓)
+        trades: List[TradeRecord] = strat.analyzers.trade_capture.get_analysis() if hasattr(strat.analyzers, 'trade_capture') else []
 
-        # 在策略后添加一个记录器 (仅监听)
-        cerebro.addstrategy(_TradeRecorder)
-
-        # 回测结束后 trade_records 填入
-
-        trades: List[TradeRecord] = trade_records
-
-        # 聚宽兼容记录
-        # 给 record 补日期
+        # 聚宽兼容记录日期对齐: 若用户 record 次数与 equity_curve 后段长度匹配, 补齐日期
         jq_records = jq_state.get('records') if 'jq_state' in locals() else None
         if jq_records and equity_curve:
-            date_map = equity_curve[-len(jq_records):]  # 简单映射尾部
+            tail_len = min(len(jq_records), len(equity_curve))
+            date_map = equity_curve[-tail_len:]
+            # 只给缺失 dt 的填充
+            offset = len(jq_records) - tail_len
             for i, r in enumerate(jq_records):
-                if r.get('dt') is None and i < len(date_map):
-                    r['dt'] = date_map[i]['date']
+                if r.get('dt') is None and i >= offset:
+                    map_idx = i - offset
+                    if 0 <= map_idx < tail_len:
+                        r['dt'] = date_map[map_idx]['date']
         jq_logs = jq_state.get('log') if 'jq_state' in locals() else None
 
         return BacktestResult(

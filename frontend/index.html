@@ -68,8 +68,8 @@
     <input id="start" type="date" value="2025-01-01" />
     <label>结束日期</label>
     <input id="end" type="date" value="2025-03-01" />
-    <label>基准 (可选)</label>
-    <input id="benchmark" placeholder="例如: 000300_日" />
+  <label>解析到的基准 (来自 set_benchmark)</label>
+  <div id="parsedBenchmark" style="min-height:24px;display:flex;flex-wrap:wrap;gap:6px;"></div>
     <label>初始资金</label>
     <input id="cash" type="number" value="100000" />
     <label>策略代码 (UserStrategy 或 initialize/handle_data)</label>
@@ -134,7 +134,7 @@ class UserStrategy(bt.Strategy):
     const statusBar = document.getElementById('statusBar');
     function setStatus(msg, cls='') { statusBar.textContent = msg; statusBar.className = cls; }
 
-    function extractSymbolsFromCode(code){
+  function extractSymbolsFromCode(code){
       // 支持 g.security = '000516.XSHE' 或 g.security=['000001.XSHE','000002.XSHE']
       // 也支持 g.security = '000516_daily'
       const singleRe = /g\.security\s*=\s*['"]([^'"\n]+)['"]/i;
@@ -150,10 +150,62 @@ class UserStrategy(bt.Strategy):
       }
       // 转换 000001.XSHE -> 000001_daily 与 .XSHG 同理
       syms = syms.map(s=>{
-        if(/\.xshe$/i.test(s) || /\.xshg$/i.test(s)) return s.split('.')[0] + '_daily';
+        const lower = s.toLowerCase();
+        const preserved = ['_daily','_daily_qfq','_daily_hfq','_qfq','_hfq','_日','_日_qfq','_日_hfq'];
+        if(preserved.some(p=> lower.endsWith(p))) return s.replace('.XSHE','').replace('.XSHG','');
+        if(/\.xshe$/i.test(s) || /\.xshg$/i.test(s)) {
+          const base = s.split('.')[0];
+          // 新规则：标的优先显示 *_daily_qfq （与后端匹配逻辑一致）
+          return base + '_daily_qfq';
+        }
+        return s;
+      });
+      // 归一化重复后缀
+      syms = syms.map(s=>{
+        let l = s.toLowerCase();
+        const repl = [
+          ['_daily_qfq_daily','_daily_qfq'],
+          ['_daily_hfq_daily','_daily_hfq'],
+          ['_日_qfq_日','_日_qfq'],
+          ['_日_hfq_日','_日_hfq'],
+          ['_daily_daily','_daily']
+        ];
+        for(const [oldv,newv] of repl){
+          if(l.endsWith(oldv)){
+            return s.slice(0, s.length - oldv.length) + newv;
+          }
+        }
         return s;
       });
       return syms;
+    }
+
+  function extractBenchmarkFromCode(code){
+      const bmRe = /set_benchmark\(\s*['"]([^'"\n]+)['"]\s*\)/i;
+      const m = code.match(bmRe);
+      if(!m) return null;
+      let raw = m[1].trim();
+      // 复用与证券同样的映射逻辑
+      const lower = raw.toLowerCase();
+      const preserved = ['_daily','_daily_qfq','_daily_hfq','_qfq','_hfq','_日','_日_qfq','_日_hfq'];
+      if(preserved.some(p=> lower.endsWith(p))) return raw.replace('.XSHE','').replace('.XSHG','');
+      if(/\.xshe$/i.test(raw) || /\.xshg$/i.test(raw)) {
+        const base = raw.split('.')[0];
+        // 新规则：基准优先显示 *_日
+        return base + '_日';
+      }
+      return raw;
+    }
+
+    function renderBenchmark(bm){
+      const box = document.getElementById('parsedBenchmark');
+      box.innerHTML='';
+      const span = document.createElement('span');
+      span.className='pill';
+      if(!bm){
+        span.style.opacity=.55; span.textContent='未解析到 (可在代码 set_benchmark)';
+      } else span.textContent = bm;
+      box.appendChild(span);
     }
 
     function renderParsedSymbols(list){
@@ -178,8 +230,10 @@ class UserStrategy(bt.Strategy):
     // 初次与输入时解析显示
     const codeTextarea = document.getElementById('code');
     function refreshParsed(){
-      const list = extractSymbolsFromCode(codeTextarea.value);
+      const code = codeTextarea.value;
+      const list = extractSymbolsFromCode(code);
       renderParsedSymbols(list);
+      renderBenchmark(extractBenchmarkFromCode(code));
     }
     codeTextarea.addEventListener('input', ()=>{
       // 去抖可选; 这里直接刷新
@@ -193,14 +247,16 @@ class UserStrategy(bt.Strategy):
       runBtn.disabled = true; runBtn.textContent = '运行中...';
   const code = document.getElementById('code').value;
   const extracted = extractSymbolsFromCode(code);
-  renderParsedSymbols(extracted); // 运行前再次刷新
+  const benchParsed = extractBenchmarkFromCode(code);
+  renderParsedSymbols(extracted); // 运行前刷新
+  renderBenchmark(benchParsed);
       const payload = {
         symbol: extracted.join(',') || document.getElementById('symbol').value.trim(),
         start: document.getElementById('start').value,
         end: document.getElementById('end').value,
         cash: parseFloat(document.getElementById('cash').value),
         strategy_code: code,
-        benchmark_symbol: document.getElementById('benchmark').value.trim() || null,
+        benchmark_symbol: null, // 交由后端自动解析 set_benchmark
       };
       if(!extracted.length){
         // 给用户提示仍可兼容旧写法

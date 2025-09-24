@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import os
+from dataclasses import asdict
 from .backtest_engine import run_backtest
 
 app = FastAPI(title="Local Backtest Platform", version="0.1.0")
@@ -41,6 +42,7 @@ async def api_backtest(req: BacktestRequest):
         req.strategy_params,
         benchmark_symbol=req.benchmark_symbol,
     )
-    return JSONResponse(result.__dict__)
+    # 使用 asdict 递归转换 dataclass, 否则 TradeRecord 列表无法直接 JSON 序列化
+    return JSONResponse(asdict(result))
 
 # 方便 uvicorn 直接运行: uvicorn backend.app.main:app --reload
