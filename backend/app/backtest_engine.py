@@ -292,7 +292,7 @@ def compile_user_strategy(code: str):
                 # 允许 MA 等指标还未就绪也执行
                 self.next()
 
-            def next(self):  # 每个bar 调用 handle_data
+            def _run_handle(self):
                 # 提供 attribute_history, order_value, order_target 实现
                 def attribute_history(security: str, n: int, unit: str, fields: List[str]):
                     # 支持 unit 为 '1d' 或 '1D' 或 'day'
@@ -366,6 +366,11 @@ def compile_user_strategy(code: str):
                         tail = df.tail(n)
                         out = tail[['datetime', *fields]].copy()
                         out.index = out['datetime'].dt.date.astype(str)
+                        # 与聚宽展示一致，不显示索引名
+                        try:
+                            out.index.name = None
+                        except Exception:
+                            pass
                         out = out.drop(columns=['datetime'])
                         return _JQDataFrame(out)
                     # 回退：直接从数据行取，尽量用日期索引
@@ -400,23 +405,31 @@ def compile_user_strategy(code: str):
                     # 暖场期不交易
                     if exec_env['jq_state'].get('in_warmup'):
                         return
-                    # 根据聚宽选项 use_real_price 决定使用本 bar 收盘价(真实价) 还是开盘价近似下一bar成交
-                    _use_real = exec_env['jq_state']['options'].get('use_real_price') if 'jq_state' in exec_env else False
-                    # 若数据无 open 列则回退 close
-                    chosen_price = None
-                    if _use_real:
-                        # 真实价：当前 bar close，并依赖 broker cheat-on-close 以便本 bar 内成交
+                    # 成交定价策略：默认 'open'（聚宽日频），可通过 set_option('fill_price', 'close') 切换
+                    fill_price = str(exec_env['jq_state']['options'].get('fill_price', 'open')).lower() if 'jq_state' in exec_env else 'open'
+                    if fill_price == 'close':
                         chosen_price = getattr(self.data, 'close')[0]
                     else:
-                        # 模拟 next bar 成交：使用当前 open 作为近似（简化）
-                        if hasattr(self.data, 'open'):
-                            chosen_price = self.data.open[0]
-                        else:
-                            chosen_price = self.data.close[0]
+                        chosen_price = getattr(self.data, 'open')[0] if hasattr(self.data, 'open') else getattr(self.data, 'close')[0]
                     if chosen_price <= 0:
                         return
                     # 支持正负 value：正为买入金额，负为卖出金额
-                    size = int(value / chosen_price)
+                    size_raw = int(value / chosen_price)
+                    # A股规则：股数需为100的整数倍
+                    lot = int(exec_env['jq_state']['options'].get('lot', 100)) if 'jq_state' in exec_env else 100
+                    adj = (abs(size_raw) // lot) * lot
+                    size = adj if size_raw >= 0 else -adj
+                    if size_raw != 0 and abs(size) != abs(size_raw):
+                        # 打印与聚宽类似的提示
+                        try:
+                            exec_env['log'].info(f"[order_value] 数量需为 {lot} 的整数倍，调整为 {abs(size)}")
+                        except Exception:
+                            pass
+                    # 记录下单定价与数量，便于核对现金差异
+                    try:
+                        exec_env['log'].info(f"[order_value] price={chosen_price:.4f} final_size={size}")
+                    except Exception:
+                        pass
                     if size == 0:
                         return
                     if size > 0:
@@ -434,7 +447,11 @@ def compile_user_strategy(code: str):
                     - target == 0 等价于平仓
                     """
                     cur = int(getattr(self.position, 'size', 0) or 0)
-                    tgt = int(target or 0)
+                    tgt_raw = int(target or 0)
+                    lot = int(exec_env['jq_state']['options'].get('lot', 100)) if 'jq_state' in exec_env else 100
+                    # 目标同样按100股对齐
+                    tgt = (abs(tgt_raw) // lot) * lot
+                    tgt = tgt if tgt_raw >= 0 else -tgt
                     delta = tgt - cur
                     if delta == 0:
                         return
@@ -483,6 +500,23 @@ def compile_user_strategy(code: str):
                         pass
                     raise
 
+            def next(self):  # 每个bar 调用 handle_data
+                # 当选择收盘成交(fill_price=close)时，在 next(收盘阶段)执行；否则跳过
+                fillp = str(exec_env['jq_state']['options'].get('fill_price', 'open')).lower() if 'jq_state' in exec_env else 'open'
+                if fillp == 'close':
+                    self._run_handle()
+                else:
+                    # open 成交在 next_open 中执行
+                    return
+
+            def next_open(self):
+                # 当选择开盘成交(fill_price=open)时，在 next_open(开盘阶段)执行；否则跳过
+                fillp = str(exec_env['jq_state']['options'].get('fill_price', 'open')).lower() if 'jq_state' in exec_env else 'open'
+                if fillp == 'open':
+                    self._run_handle()
+                else:
+                    return
+
         return UserStrategy, jq_state
 
     raise ValueError('策略代码需定义 UserStrategy(bt.Strategy) 或 initialize/handle_data 聚宽风格函数')
@@ -521,7 +555,14 @@ def run_backtest(
         StrategyCls, jq_state = compile_user_strategy(strategy_code)
         # 记录用户开始日期，供暖场/日志用
         jq_state['user_start'] = start
-        cerebro = bt.Cerebro()
+        # 根据 fill_price 决定是否启用 cheat-on-open（保证当日开盘撮合）
+        fill_price_opt = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
+        try:
+            cerebro = bt.Cerebro(cheat_on_open=(fill_price_opt == 'open'))
+            jq_state['log'].append(f"[exec_mode] fill_price={fill_price_opt} cheat_on_open={fill_price_opt == 'open'}")
+        except Exception:
+            cerebro = bt.Cerebro()
+            jq_state['log'].append(f"[exec_mode] fill_price={fill_price_opt} cheat_on_open=unsupported")
         cerebro.broker.setcash(cash)
 
         # 2. 标的解析与数据加载
@@ -613,8 +654,14 @@ def run_backtest(
         # 3. 处理聚宽 set_option 影响 (commission / slippage / use_real_price)
         strategy_params = strategy_params or {}
         commission = jq_state.get('options', {}).get('commission')
-        if commission is not None:
+        if commission is None:
+            # 默认按照 0.03% 佣金，贴近聚宽
+            commission = 0.0003
+            jq_state['options']['commission'] = commission
+        try:
             cerebro.broker.setcommission(commission=commission)
+        except Exception:
+            pass
         slippage_perc = jq_state.get('options', {}).get('slippage_perc')
         if slippage_perc is not None:
             try:
@@ -622,11 +669,16 @@ def run_backtest(
             except Exception:
                 pass
         use_real_price_opt = jq_state.get('options', {}).get('use_real_price', False)
-        if use_real_price_opt:
-            try:
+        # 成交价格控制：fill_price=open/close（默认 open）。
+        fill_price_opt = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
+        # 优先尝试 cheat-on-open / cheat-on-close 与所选价格匹配
+        try:
+            if fill_price_opt == 'close' and hasattr(cerebro.broker, 'set_coc'):
                 cerebro.broker.set_coc(True)
-            except Exception:
-                pass
+            elif fill_price_opt != 'close' and hasattr(cerebro.broker, 'set_coo'):
+                cerebro.broker.set_coo(True)
+        except Exception:
+            pass
 
         # 4. 定义 TradeCapture Analyzer (捕获已平仓 & 未平仓)
         class TradeCapture(bt.Analyzer):
@@ -759,6 +811,11 @@ def run_backtest(
                     name = getattr(data, '_name', None)
                 except Exception:
                     name = None
+                # 将实际成交写入 JQ 日志，方便与期望价格核对
+                try:
+                    log_obj.info(f"[fill] {dt} {side} {name} size={abs(size)} price={price} value={value} commission={comm}")
+                except Exception:
+                    pass
                 self.records.append(OrderRecord(
                     datetime=dt or '',
                     symbol=name,
