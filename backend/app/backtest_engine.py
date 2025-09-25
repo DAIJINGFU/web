@@ -299,35 +299,91 @@ def compile_user_strategy(code: str):
                     if unit.lower() not in ('1d', 'day', 'd'):
                         raise ValueError('attribute_history 目前仅支持日级 unit=1d')
                     import pandas as _pd
+                    # JQ 兼容：Series/DF 支持使用负整数做“位置”索引，如 s[-1] 代表最后一项
+                    class _JQSeries(_pd.Series):
+                        @property
+                        def _constructor(self):
+                            return _JQSeries
+
+                        def __getitem__(self, key):
+                            # 如果是整数或整型切片，则按位置 iloc 处理（与聚宽兼容）
+                            if isinstance(key, int):
+                                return self.iloc[key]
+                            if isinstance(key, slice):
+                                is_int = lambda x: (x is None) or isinstance(x, int)
+                                if is_int(key.start) and is_int(key.stop) and (key.step is None or isinstance(key.step, int)):
+                                    return _JQSeries(self.iloc[key])
+                            return super().__getitem__(key)
+
+                    class _JQDataFrame(_pd.DataFrame):
+                        @property
+                        def _constructor(self):
+                            return _JQDataFrame
+
+                        @property
+                        def _constructor_sliced(self):
+                            # 让 df['col'] 返回的 Series 具备负整数位置索引语义
+                            return _JQSeries
+
+                        def __getitem__(self, key):
+                            # 若 key 为整数或整型切片，则按位置 iloc 处理（与聚宽兼容）
+                            if isinstance(key, int):
+                                return self.iloc[key]
+                            if isinstance(key, slice):
+                                is_int = lambda x: (x is None) or isinstance(x, int)
+                                if is_int(key.start) and is_int(key.stop) and (key.step is None or isinstance(key.step, int)):
+                                    return _JQDataFrame(self.iloc[key])
+                            return super().__getitem__(key)
+
                     jqst = exec_env['jq_state']
                     # 计算当前日期
                     try:
                         cur_date = bt.num2date(self.data.datetime[0]).date()
                     except Exception:
                         cur_date = None
-                    full_df = jqst.get('history_df')
+                    # 根据传入 security 选择对应的完整历史
+                    full_df = None
+                    try:
+                        sym_map = jqst.get('history_df_map') or {}
+                        base = str(security).split('.')[0]
+                        # 先精确匹配 key == base，再匹配以 base_ 开头
+                        if base in sym_map:
+                            full_df = sym_map[base]
+                        else:
+                            for k, v in sym_map.items():
+                                if str(k).startswith(base + '_') or str(k).startswith(base):
+                                    full_df = v
+                                    break
+                        if full_df is None:
+                            full_df = jqst.get('history_df')
+                    except Exception:
+                        full_df = jqst.get('history_df')
                     if isinstance(full_df, _pd.DataFrame) and cur_date is not None:
-                        df = full_df[full_df['datetime'].dt.date <= cur_date]
+                        # JQ 语义：不包含当日，返回“当前日之前”的 n 条
+                        df = full_df[full_df['datetime'].dt.date < cur_date]
                         if df.empty:
-                            return _pd.DataFrame({f: [] for f in fields})
+                            return _JQDataFrame({f: [] for f in fields})
                         tail = df.tail(n)
                         out = tail[['datetime', *fields]].copy()
                         out.index = out['datetime'].dt.date.astype(str)
                         out = out.drop(columns=['datetime'])
-                        return out
+                        return _JQDataFrame(out)
                     # 回退：直接从数据行取，尽量用日期索引
-                    length = min(n, len(self.data))
+                    # 不包含当前 bar（索引 0），所以最多使用 len(self.data) - 1 条
+                    available = max(len(self.data) - 1, 0)
+                    length = min(n, available)
                     if length <= 0:
-                        return _pd.DataFrame({f: [] for f in fields})
+                        return _JQDataFrame({f: [] for f in fields})
                     data_dict: Dict[str, List[float]] = {}
                     for f in fields:
                         line = getattr(self.data, f, None)
                         if line is None:
                             data_dict[f] = [float('nan')] * length
                             continue
-                        seq = list(line.get(size=length))
-                        data_dict[f] = seq[-length:]
-                    # 构造日期索引（更稳健：逐条读取末尾 length 个 bar 的日期）
+                        # 取“之前”的 length 条（不包含索引 0 当日）：[-length, ..., -1]
+                        vals = [line[i] for i in range(-length, 0)] if length > 0 else []
+                        data_dict[f] = vals
+                    # 构造日期索引（更稳健：逐条读取末尾 length 个 bar 的日期，排除当日）
                     try:
                         # 使用负索引逐条转换，避免某些环境下 get(size=) 异常
                         str_idx = []
@@ -338,7 +394,7 @@ def compile_user_strategy(code: str):
                     except Exception:
                         # 仍然失败则退回负索引
                         str_idx = list(range(-length, 0))
-                    return _pd.DataFrame(data_dict, index=str_idx)
+                    return _JQDataFrame(_pd.DataFrame(data_dict, index=str_idx))
 
                 def order_value(security: str, value: float):
                     # 暖场期不交易
@@ -407,7 +463,25 @@ def compile_user_strategy(code: str):
                 exec_env['order_value'] = order_value
                 exec_env['order_target'] = order_target
 
-                handle_func(self._jq_context, None)
+                # 暖场阶段不调用用户 handle_data（仅用于准备历史数据），与聚宽一致
+                if jq_state_ref.get('in_warmup'):
+                    return
+
+                # 调用用户 handle_data，并在出错时将堆栈写入 JQ Logs，便于排查
+                try:
+                    handle_func(self._jq_context, None)
+                except Exception:
+                    try:
+                        import traceback as _tb
+                        err = _tb.format_exc()
+                        # 暖场期也输出异常，便于发现问题
+                        exec_env['jq_state']['in_warmup'] = False
+                        _logger = exec_env.get('log')
+                        if _logger is not None:
+                            _logger.info("handle_data 发生异常:\n" + err)
+                    except Exception:
+                        pass
+                    raise
 
         return UserStrategy, jq_state
 
