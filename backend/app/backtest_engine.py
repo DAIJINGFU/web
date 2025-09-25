@@ -88,6 +88,17 @@ class TradeRecord:
     pnl_comm: float | None = None
 
 @dataclass
+class OrderRecord:
+    datetime: str
+    symbol: str | None
+    side: str            # BUY / SELL
+    size: float          # 本次成交股数(带方向)
+    price: float         # 本次成交价格
+    value: float         # 本次成交金额(含方向)
+    commission: float
+    status: str          # Completed / Canceled / Rejected 等
+
+@dataclass
 class BacktestResult:
     metrics: Dict[str, Any]
     equity_curve: List[Dict[str, Any]]  # 策略累计净值
@@ -96,6 +107,7 @@ class BacktestResult:
     excess_curve: List[Dict[str, Any]]  # 超额累计净值 (策略/基准 -1)
     trades: List[TradeRecord]
     log: str
+    orders: List[OrderRecord] | None = None
     jq_records: List[Dict[str, Any]] | None = None
     jq_logs: List[str] | None = None
 
@@ -158,12 +170,35 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         'records': [],
         'log': [],
         'g': g,
+        # 运行辅助状态
+        'history_df': None,      # 单标的完整历史（DataFrame，含 datetime 列）
+        'history_df_map': {},    # 多标的缓存
+        'current_dt': None,      # 当前 bar 展示时间（字符串）
+        'user_start': None,      # 用户选择的开始日期（YYYY-MM-DD）
+        'in_warmup': False,      # 暖场阶段（< user_start）
     }
 
     class _Log:
         def info(self, msg):
-            jq_state['log'].append(str(msg))
-            print('[INFO]', msg)
+            # 暖场阶段不输出日志（仅用于准备历史数据）
+            if jq_state.get('in_warmup'):
+                return
+            # 聚宽风格：首行包含时间与级别，续行缩进
+            dt = jq_state.get('current_dt')
+            if not dt:
+                try:
+                    from datetime import datetime as _dt
+                    dt = _dt.now().strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    dt = '0000-00-00 00:00:00'
+            header = f"{dt} - INFO - "
+            s = str(msg)
+            lines = s.splitlines() or ['']
+            first = header + lines[0]
+            cont = ['    ' + ln for ln in lines[1:]]
+            formatted = '\n'.join([first] + cont)
+            jq_state['log'].append(formatted)
+            print(formatted)
 
     log_obj = _Log()
 
@@ -175,6 +210,9 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         jq_state['log'].append(f"[set_option] {name}={value}")
 
     def record(**kwargs):
+        # 暖场阶段不记录（避免越界日期）
+        if jq_state.get('in_warmup'):
+            return
         jq_state['records'].append({'dt': None, **kwargs})
 
     # attribute_history 简化: 直接从已加载的 pandas 数据缓存里取；此时还未有数据引用，运行期在包装策略里实现
@@ -260,23 +298,52 @@ def compile_user_strategy(code: str):
                     # 支持 unit 为 '1d' 或 '1D' 或 'day'
                     if unit.lower() not in ('1d', 'day', 'd'):
                         raise ValueError('attribute_history 目前仅支持日级 unit=1d')
-                    length = min(n, len(self.data))
                     import pandas as _pd
+                    jqst = exec_env['jq_state']
+                    # 计算当前日期
+                    try:
+                        cur_date = bt.num2date(self.data.datetime[0]).date()
+                    except Exception:
+                        cur_date = None
+                    full_df = jqst.get('history_df')
+                    if isinstance(full_df, _pd.DataFrame) and cur_date is not None:
+                        df = full_df[full_df['datetime'].dt.date <= cur_date]
+                        if df.empty:
+                            return _pd.DataFrame({f: [] for f in fields})
+                        tail = df.tail(n)
+                        out = tail[['datetime', *fields]].copy()
+                        out.index = out['datetime'].dt.date.astype(str)
+                        out = out.drop(columns=['datetime'])
+                        return out
+                    # 回退：直接从数据行取，尽量用日期索引
+                    length = min(n, len(self.data))
                     if length <= 0:
                         return _pd.DataFrame({f: [] for f in fields})
                     data_dict: Dict[str, List[float]] = {}
                     for f in fields:
                         line = getattr(self.data, f, None)
                         if line is None:
-                            # 用 NaN 填充
                             data_dict[f] = [float('nan')] * length
                             continue
                         seq = list(line.get(size=length))
                         data_dict[f] = seq[-length:]
-                    idx = list(range(-length, 0))  # 负索引
-                    return _pd.DataFrame(data_dict, index=idx)
+                    # 构造日期索引（更稳健：逐条读取末尾 length 个 bar 的日期）
+                    try:
+                        # 使用负索引逐条转换，避免某些环境下 get(size=) 异常
+                        str_idx = []
+                        for i in range(-length, 0):
+                            dt_num = self.data.datetime[i]
+                            dt_str = bt.num2date(dt_num).date().isoformat()
+                            str_idx.append(dt_str)
+                    except Exception:
+                        # 仍然失败则退回负索引
+                        str_idx = list(range(-length, 0))
+                    return _pd.DataFrame(data_dict, index=str_idx)
 
                 def order_value(security: str, value: float):
+                    # 暖场期不交易
+                    if exec_env['jq_state'].get('in_warmup'):
+                        return
                     # 根据聚宽选项 use_real_price 决定使用本 bar 收盘价(真实价) 还是开盘价近似下一bar成交
                     _use_real = exec_env['jq_state']['options'].get('use_real_price') if 'jq_state' in exec_env else False
                     # 若数据无 open 列则回退 close
@@ -292,16 +359,50 @@ def compile_user_strategy(code: str):
                             chosen_price = self.data.close[0]
                     if chosen_price <= 0:
                         return
+                    # 支持正负 value：正为买入金额，负为卖出金额
                     size = int(value / chosen_price)
+                    if size == 0:
+                        return
                     if size > 0:
                         self.buy(size=size)
+                    else:
+                        self.sell(size=abs(size))
 
                 def order_target(security: str, target: float):
-                    if target == 0 and self.position:
-                        self.close()
+                    # 暖场期不交易
+                    if exec_env['jq_state'].get('in_warmup'):
+                        return
+                    """将当前持仓调整到目标股数 target。
+                    - target 为目标持仓股数（可为浮点，将被取整）
+                    - delta > 0 执行买入 delta 股；delta < 0 执行卖出 |delta| 股
+                    - target == 0 等价于平仓
+                    """
+                    cur = int(getattr(self.position, 'size', 0) or 0)
+                    tgt = int(target or 0)
+                    delta = tgt - cur
+                    if delta == 0:
+                        return
+                    if delta > 0:
+                        self.buy(size=delta)
+                    else:
+                        # delta < 0 -> 卖出 |delta|
+                        # 若目标为 0 则等价于平仓
+                        if tgt == 0 and self.position:
+                            self.close()
+                        else:
+                            self.sell(size=abs(delta))
 
                 # 动态覆盖 exec 环境里的函数（只在第一次后就不再改变 jq_state）
                 jq_state_ref = exec_env['jq_state']
+                # 设置当前 bar 的时间与暖场标记（用户选择开始日前为暖场）
+                try:
+                    cur_dt = bt.num2date(self.data.datetime[0])
+                    cur_date_str = cur_dt.date().isoformat()
+                    jq_state_ref['current_dt'] = f"{cur_date_str} 09:30:00"
+                    user_start = jq_state_ref.get('user_start')
+                    jq_state_ref['in_warmup'] = bool(user_start) and (cur_date_str < str(user_start))
+                except Exception:
+                    pass
                 exec_env['attribute_history'] = attribute_history
                 exec_env['order_value'] = order_value
                 exec_env['order_target'] = order_target
@@ -344,6 +445,8 @@ def run_backtest(
     try:
         # 1. 编译策略 & 初始化 Cerebro
         StrategyCls, jq_state = compile_user_strategy(strategy_code)
+        # 记录用户开始日期，供暖场/日志用
+        jq_state['user_start'] = start
         cerebro = bt.Cerebro()
         cerebro.broker.setcash(cash)
 
@@ -411,9 +514,27 @@ def run_backtest(
         if benchmark_symbol:
             benchmark_symbol = _map_benchmark_code(benchmark_symbol)
 
-        for sym in symbols:
-            dfeed = load_csv_data(sym, start, end, datadir)
+        # 读取暖场天数（默认 250，可 set_option('history_lookback_days', N)）
+        lookback_days = 250
+        try:
+            lb = jq_state.get('options', {}).get('history_lookback_days')
+            if isinstance(lb, (int, float)) and lb >= 0:
+                lookback_days = int(lb)
+        except Exception:
+            pass
+        warmup_start = (pd.to_datetime(start) - pd.Timedelta(days=lookback_days)).date().isoformat()
+
+        for i, sym in enumerate(symbols):
+            dfeed = load_csv_data(sym, warmup_start, end, datadir)
             cerebro.adddata(dfeed, name=sym)
+            # 缓存完整历史（用于 attribute_history）
+            try:
+                full_df = load_csv_dataframe(sym, warmup_start, end, datadir)
+                jq_state['history_df_map'][sym] = full_df
+                if i == 0:
+                    jq_state['history_df'] = full_df
+            except Exception:
+                pass
 
         # 3. 处理聚宽 set_option 影响 (commission / slippage / use_real_price)
         strategy_params = strategy_params or {}
@@ -532,6 +653,52 @@ def run_backtest(
             def get_analysis(self):
                 return self.records
 
+        # 4.2 订单级捕获（每笔成交）
+        class OrderCapture(bt.Analyzer):
+            def start(self):
+                self.records: List[OrderRecord] = []
+
+            def _fmt_date(self, dt):
+                try:
+                    return bt.num2date(dt).date().isoformat() if dt else None
+                except Exception:
+                    return None
+
+            def notify_order(self, order):
+                # 只记录完成的成交（可根据需求扩展到部分成交）
+                if order.status not in [order.Completed, order.Canceled, order.Rejected, order.Margin]:
+                    return
+                dt = None
+                try:
+                    dt = self._fmt_date(order.executed.dt)
+                except Exception:
+                    dt = None
+                # 推断多空方向（正为买，负为卖）
+                size = getattr(order.executed, 'size', 0.0)
+                price = getattr(order.executed, 'price', 0.0)
+                value = getattr(order.executed, 'value', 0.0)
+                comm = getattr(order.executed, 'comm', 0.0)
+                side = 'BUY' if size >= 0 else 'SELL'
+                name = None
+                try:
+                    data = order.data
+                    name = getattr(data, '_name', None)
+                except Exception:
+                    name = None
+                self.records.append(OrderRecord(
+                    datetime=dt or '',
+                    symbol=name,
+                    side=side,
+                    size=size,
+                    price=price,
+                    value=value,
+                    commission=comm,
+                    status=order.getstatusname(),
+                ))
+
+            def get_analysis(self):
+                return self.records
+
         # 5. 注册 analyzers
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
@@ -539,6 +706,7 @@ def run_backtest(
         cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
         cerebro.addanalyzer(TradeCapture, _name='trade_capture')
+        cerebro.addanalyzer(OrderCapture, _name='order_capture')
 
         # 6. 添加策略并运行
         cerebro.addstrategy(StrategyCls, **strategy_params)
@@ -552,14 +720,21 @@ def run_backtest(
         trade_ana = strat.analyzers.trades.get_analysis()
         timereturn = strat.analyzers.timereturn.get_analysis()
 
-        # 策略权益曲线
-        equity_curve = []
+        # 策略权益曲线（包含暖场），再切到用户起始日并归一
+        tmp_eq = []
         cumulative = 1.0
         for dt, r in timereturn.items():
             cumulative *= (1 + r)
-            equity_curve.append({'date': dt.strftime('%Y-%m-%d'), 'equity': cumulative})
+            tmp_eq.append({'date': dt.strftime('%Y-%m-%d'), 'equity': cumulative})
+        # 切片到 >= start，并用首日值归一到 1
+        eq_filtered = [p for p in tmp_eq if p['date'] >= start]
+        if eq_filtered:
+            base = eq_filtered[0]['equity'] or 1.0
+            equity_curve = [{'date': p['date'], 'equity': (p['equity'] / base if base else p['equity'])} for p in eq_filtered]
+        else:
+            equity_curve = []
 
-        daily_returns = [{'date': dt.strftime('%Y-%m-%d'), 'ret': r} for dt, r in timereturn.items()]
+        daily_returns = [{'date': dt.strftime('%Y-%m-%d'), 'ret': r} for dt, r in timereturn.items() if dt.strftime('%Y-%m-%d') >= start]
 
         # 交易聚合数据
         total_trades = trade_ana.get('total', {}).get('total', 0)
@@ -647,8 +822,9 @@ def run_backtest(
         if 'benchmark_detect_phase' not in metrics:
             metrics['benchmark_detect_phase'] = 'none'
 
-        # 回测结束，从 analyzer 里取交易记录 (包含已平仓 + 未平仓)
+        # 回测结束，从 analyzer 里取交易记录 (包含已平仓 + 未平仓) 及订单级别明细
         trades: List[TradeRecord] = strat.analyzers.trade_capture.get_analysis() if hasattr(strat.analyzers, 'trade_capture') else []
+        orders: List[OrderRecord] = strat.analyzers.order_capture.get_analysis() if hasattr(strat.analyzers, 'order_capture') else []
 
         # 聚宽兼容记录日期对齐: 若用户 record 次数与 equity_curve 后段长度匹配, 补齐日期
         jq_records = jq_state.get('records') if 'jq_state' in locals() else None
@@ -671,6 +847,7 @@ def run_backtest(
             benchmark_curve=benchmark_curve,
             excess_curve=excess_curve,
             trades=trades,
+            orders=orders,
             log=log_buffer.getvalue(),
             jq_records=jq_records,
             jq_logs=jq_logs,
