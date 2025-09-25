@@ -623,14 +623,17 @@ class UserStrategy(bt.Strategy):
       function formatMetricValue(k, v) {
         if (v === null || v === undefined) return "-";
         if (typeof v === "number") {
+          // α 显示更高精度（日度 α 往往很小，避免被 3 位小数四舍五入到 0.000）
+          if (k === "alpha") return v.toFixed(6);
           if (["final_value"].includes(k)) return v.toFixed(2);
-          if (
-            /(pct|rate|return|win|sharpe|drawdown|excess|rt_annual|rnorm100)/i.test(
-              k
-            )
-          ) {
+          if (/(pct|rate|return|win|drawdown|excess|rt_annual)/i.test(k)) {
             // raw ratio display as % if in -5..5
             if (Math.abs(v) < 5) return (v * 100).toFixed(2) + "%";
+          }
+          // α 与 α(年化) 都按小数显示（不加百分号）
+          // 确保最大回撤使用百分号（后端常给 0.0778 这样的比例）
+          if (k === "max_drawdown" && Math.abs(v) <= 1.5) {
+            return (v * 100).toFixed(2) + "%";
           }
           return v.toFixed(3);
         }
@@ -638,17 +641,41 @@ class UserStrategy(bt.Strategy):
       }
 
       function renderKPIs(metrics) {
+        // 指标中文说明（悬浮提示）
+        const help = {
+          pnl_pct:
+            "策略收益：回测期末总收益率 = 期末资产/初始资金 - 1（展示为百分比）",
+          benchmark_return:
+            "基准收益：基准累计净值的终值 - 1。说明：基准净值从起始日前一个交易日的收盘价进行归一，避免跨年或非交易日造成偏移。",
+          excess_return:
+            "超额收益：策略相对基准的累计收益差 = 策略终值/基准终值 - 1",
+          rt_annual:
+            "年化：根据日收益换算的年化收益率（Backtrader Returns 分析器计算）",
+          sharpe:
+            "夏普：风险调整后收益 = 年化超额收益 / 年化波动，数值越高越好（无单位，不以%显示）",
+          max_drawdown:
+            "最大回撤：整个回测期间相对历史峰值的最大回撤幅度（负值，绝对值越大越差）",
+          win_rate: "胜率：盈利交易笔数 / 总交易笔数",
+          total_trades:
+            "总交易：回测期间成交（平仓/开仓）统计的总笔数（按 Backtrader 交易统计器）",
+          alpha:
+            "阿尔法：CAPM 模型中的 α 值（默认按年化显示，若后端 set_option('alpha_unit','daily') 则显示日度；均不以%展示）",
+          beta: "β：CAPM 模型中的 β 值，衡量策略相对基准的系统性风险敞口（无单位，可为负）",
+          drawdown_interval:
+            "回撤区间：最大回撤发生时，从历史峰值日期到最低点日期的时间区间",
+        };
         const order = [
           ["pnl_pct", "策略收益"],
-          ["benchmark_final", "基准终值"],
+          ["benchmark_return", "基准收益"],
           ["excess_return", "超额收益"],
           ["rt_annual", "年化"],
-          ["sharpe", "夏普"],
+          ["sharpe", "夏普(年化)"],
+          ["alpha", "阿尔法"],
+          ["beta", "β"],
           ["max_drawdown", "最大回撤"],
           ["win_rate", "胜率"],
           ["total_trades", "总交易"],
-          ["rnorm100", "rnorm100"],
-          ["drawdown_len", "回撤天数"],
+          ["drawdown_interval", "回撤区间"],
         ];
         const wrap = document.getElementById("metrics");
         wrap.innerHTML = "";
@@ -657,15 +684,10 @@ class UserStrategy(bt.Strategy):
           const v = metrics[k];
           const box = document.createElement("div");
           box.className = "kpi";
+          if (help[k]) box.setAttribute("title", help[k]);
           const classMod =
             typeof v === "number" &&
-            [
-              "pnl_pct",
-              "excess_return",
-              "rt_annual",
-              "win_rate",
-              "sharpe",
-            ].includes(k)
+            ["pnl_pct", "excess_return", "rt_annual", "win_rate"].includes(k)
               ? v >= 0
                 ? " positive"
                 : " negative"
@@ -698,7 +720,11 @@ class UserStrategy(bt.Strategy):
         };
         const dates = equity.map((x) => x.date);
         // Equity & benchmark
-        const eqChart = echarts.init(document.getElementById("equityChart"));
+        const eqDiv = document.getElementById("equityChart");
+        if (eqDiv)
+          eqDiv.title =
+            "权益曲线：策略累计净值（从起始日归一到 1），按每日收益率连乘得到。";
+        const eqChart = echarts.init(eqDiv);
         eqChart.setOption({
           ...theme,
           title: { text: "权益曲线", left: 10 },
@@ -734,7 +760,11 @@ class UserStrategy(bt.Strategy):
         });
         // Drawdown
         const ddSeries = computeDrawdown(equity);
-        const ddChart = echarts.init(document.getElementById("drawdownChart"));
+        const ddDiv = document.getElementById("drawdownChart");
+        if (ddDiv)
+          ddDiv.title =
+            "回撤(%)：相对历史最高净值的跌幅比例（≤0），数值越低代表回撤越大。";
+        const ddChart = echarts.init(ddDiv);
         ddChart.setOption({
           ...theme,
           title: { text: "回撤(%)", left: 10 },
@@ -752,9 +782,11 @@ class UserStrategy(bt.Strategy):
           ],
         });
         // Daily returns
-        const drChart = echarts.init(
-          document.getElementById("dailyReturnChart")
-        );
+        const drDiv = document.getElementById("dailyReturnChart");
+        if (drDiv)
+          drDiv.title =
+            "日收益(%)：当天收益率 = 当日净值/前一日净值 - 1（以百分比展示）。";
+        const drChart = echarts.init(drDiv);
         drChart.setOption({
           ...theme,
           title: { text: "日收益(%)", left: 10 },
@@ -771,7 +803,11 @@ class UserStrategy(bt.Strategy):
           ],
         });
         // Benchmark vs strategy already covered in first; reuse for excess & cum excess
-        const bmChart = echarts.init(document.getElementById("benchmarkChart"));
+        const bmDiv = document.getElementById("benchmarkChart");
+        if (bmDiv)
+          bmDiv.title =
+            "策略 vs 基准(归一化)：策略与基准的累计净值对比，均从起始日归一为 1。";
+        const bmChart = echarts.init(bmDiv);
         bmChart.setOption({
           ...theme,
           title: { text: "策略 vs 基准(归一化)", left: 10 },
@@ -799,7 +835,11 @@ class UserStrategy(bt.Strategy):
               : []),
           ],
         });
-        const exChart = echarts.init(document.getElementById("excessChart"));
+        const exDiv = document.getElementById("excessChart");
+        if (exDiv)
+          exDiv.title =
+            "超额累计(%)：策略相对基准的累计超额 = 策略累计净值/基准累计净值 - 1（以%展示）。";
+        const exChart = echarts.init(exDiv);
         exChart.setOption({
           ...theme,
           title: { text: "超额累计(%)", left: 10 },
@@ -869,8 +909,58 @@ class UserStrategy(bt.Strategy):
         });
       }
 
+      // 计算年化收益（前端兜底）：基于日收益序列（按 250 个交易日年化）
+      function computeAnnualizedFromDailyReturns(daily) {
+        if (!Array.isArray(daily) || !daily.length) return null;
+        // 使用几何平均更稳健：(1+mean)^252 - 1 可能偏差，采用累计收益换算
+        const cum = daily.reduce((acc, x) => acc * (1 + (+x.ret || 0)), 1);
+        const n = daily.length;
+        if (n <= 0) return null;
+        return Math.pow(cum, 250 / n) - 1;
+      }
+
+      // 计算最大回撤区间（供后端缺失时兜底）：峰值日期 ~ 谷底日期
+      function computeMaxDrawdownInterval(equity) {
+        if (!Array.isArray(equity) || equity.length === 0) return null;
+        let peak = -Infinity;
+        let peakDate = null;
+        let minDD = 0;
+        let troughDate = null;
+        let bestPeakDate = null;
+        for (const p of equity) {
+          const val = +p.equity;
+          const dt = p.date;
+          if (val > peak) {
+            peak = val;
+            peakDate = dt;
+          }
+          if (peak > 0) {
+            const dd = val / peak - 1;
+            if (dd < minDD) {
+              minDD = dd;
+              troughDate = dt;
+              bestPeakDate = peakDate;
+            }
+          }
+        }
+        if (troughDate && bestPeakDate)
+          return `${bestPeakDate} ~ ${troughDate}`;
+        return null;
+      }
+
       function renderResult(data) {
-        renderKPIs(data.metrics || {});
+        // 克隆并填充前端可推导的指标
+        const derived = { ...(data.metrics || {}) };
+        if (derived.rt_annual === null || derived.rt_annual === undefined) {
+          const rt = computeAnnualizedFromDailyReturns(data.daily_returns);
+          if (rt !== null) derived.rt_annual = rt;
+        }
+        // 使用后端提供的回撤区间；若缺失则前端兜底计算
+        if (!derived.drawdown_interval) {
+          const ddInt = computeMaxDrawdownInterval(data.equity_curve);
+          if (ddInt) derived.drawdown_interval = ddInt;
+        }
+        renderKPIs(derived);
         document.getElementById("log").textContent = data.log || "";
         renderJQLogs(data.jq_logs || []);
         renderRecords(data.jq_records || []);

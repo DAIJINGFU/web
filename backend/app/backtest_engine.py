@@ -877,8 +877,8 @@ def run_backtest(
         results = cerebro.run()
         strat = results[0]
 
-        # 指标汇总
-        sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio') if hasattr(strat.analyzers, 'sharpe') else None
+        # 指标汇总（先取 BT 自带，稍后会计算并覆盖 sharpe）
+        sharpe_bt = strat.analyzers.sharpe.get_analysis().get('sharperatio') if hasattr(strat.analyzers, 'sharpe') else None
         dd = strat.analyzers.drawdown.get_analysis()
         returns = strat.analyzers.returns.get_analysis()
         trade_ana = strat.analyzers.trades.get_analysis()
@@ -909,7 +909,8 @@ def run_backtest(
         metrics = {
             'final_value': cerebro.broker.getvalue(),
             'pnl_pct': (cerebro.broker.getvalue() / cash - 1),
-            'sharpe': sharpe,
+            'sharpe': None,  # 将在下方以日收益计算年化夏普
+            'sharpe_bt': sharpe_bt,
             'max_drawdown': dd.get('max', {}).get('drawdown'),
             'max_drawdown_len': dd.get('max', {}).get('len'),
             'drawdown_pct': dd.get('drawdown'),
@@ -948,8 +949,17 @@ def run_backtest(
         else:
             metrics['benchmark_detect_phase'] = 'pre_run_explicit'
 
+        # 计算基准与超额，并准备 alpha/beta 需要的对齐日收益
+        # 将策略日收益映射为 {date_str: r}
+        strat_ret_map = {dt.strftime('%Y-%m-%d'): r for dt, r in timereturn.items()}
+
+        aligned_sr: List[float] = []
+        aligned_br: List[float] = []
         if benchmark_symbol:
-            bench_df = load_csv_dataframe(benchmark_symbol, start, end, datadir)
+            # 为了与聚宽一致，基准收益以“回测开始日前最后一个可交易日”的收盘为基准
+            # 因此这里向前多取几天，之后只在 >= start 的日期上展示，但 equity 的基准点可能在 start 之前
+            bench_warmup_start = (pd.to_datetime(start) - pd.Timedelta(days=10)).date().isoformat()
+            bench_df = load_csv_dataframe(benchmark_symbol, bench_warmup_start, end, datadir)
             if len(bench_df) == 0:
                 metrics['benchmark_final'] = None
                 metrics['excess_return'] = None
@@ -959,7 +969,36 @@ def run_backtest(
                 bench_df = bench_df[['datetime', 'close']].copy()
                 bench_df['ret'] = bench_df['close'].pct_change().fillna(0.0)
                 bench_df['equity'] = (1 + bench_df['ret']).cumprod()
-                bm_map = {d.strftime('%Y-%m-%d'): (r, eq) for d, r, eq in zip(bench_df['datetime'], bench_df['ret'], bench_df['equity'])}
+                # 找到回测开始日前（<= start）的最后一个基准日，记录基准点信息
+                base_idx = bench_df[bench_df['datetime'] <= pd.to_datetime(start)].index
+                base_row = None
+                if len(base_idx) > 0:
+                    base_row = bench_df.loc[base_idx.max()]
+                # 按基准点将 equity 归一到 1
+                try:
+                    if base_row is not None:
+                        base_equity = float(base_row['equity']) if 'equity' in base_row else None
+                    else:
+                        base_equity = float(bench_df['equity'].iloc[0]) if len(bench_df) else None
+                except Exception:
+                    base_equity = None
+                if base_equity and base_equity != 0:
+                    bench_df['equity_rebased'] = bench_df['equity'] / base_equity
+                else:
+                    bench_df['equity_rebased'] = bench_df['equity']
+                # 记录日志，便于对齐核对
+                try:
+                    if base_row is not None:
+                        jq_state['log'].append(
+                            f"[benchmark_base] base_date={base_row['datetime'].date()} base_close={float(base_row['close']):.4f} start={start}"
+                        )
+                    else:
+                        jq_state['log'].append(f"[benchmark_base] no_base_before_start start={start}")
+                except Exception:
+                    pass
+
+                # 仅在 >= start 的日期用于展示/对齐，但 equity 已含有此前基准归一
+                bm_map = {d.strftime('%Y-%m-%d'): (r, eq) for d, r, eq in zip(bench_df['datetime'], bench_df['ret'], bench_df['equity_rebased']) if d.strftime('%Y-%m-%d') >= start}
                 overlap_cnt = 0
                 for ec in equity_curve:
                     d = ec['date']
@@ -968,9 +1007,16 @@ def run_backtest(
                         benchmark_curve.append({'date': d, 'equity': beq})
                         excess_curve.append({'date': d, 'excess': ec['equity']/beq - 1 if beq != 0 else 0})
                         overlap_cnt += 1
+                        # 收集与基准对齐的策略/基准日收益
+                        sr = strat_ret_map.get(d)
+                        if sr is not None:
+                            aligned_sr.append(float(sr))
+                            aligned_br.append(float(br))
                 if benchmark_curve:
                     metrics['benchmark_final'] = benchmark_curve[-1]['equity']
                     metrics['excess_return'] = equity_curve[-1]['equity']/benchmark_curve[-1]['equity'] - 1
+                    # 新增：基准收益（终值-1）
+                    metrics['benchmark_return'] = (benchmark_curve[-1]['equity'] - 1)
                 else:
                     metrics['benchmark_final'] = None
                     metrics['excess_return'] = None
@@ -979,12 +1025,196 @@ def run_backtest(
         else:
             metrics['benchmark_final'] = None
             metrics['excess_return'] = None
+            metrics['benchmark_return'] = None
 
         # 记录使用的基准信息
         metrics['benchmark_symbol_used'] = benchmark_symbol
         metrics['benchmark_code'] = jq_state.get('benchmark') if 'jq_state' in locals() else None
         if 'benchmark_detect_phase' not in metrics:
             metrics['benchmark_detect_phase'] = 'none'
+
+        # 重新计算并覆盖夏普；计算 α/β（CAPM，默认 Rf=0，可通过 set_option('risk_free_rate') 年化设定）
+        try:
+            import math as _math
+            # 交易日年化因子（聚宽口径常用 250）
+            trading_days = 250.0
+            # 年化无风险利率（例如 0.02 表示 2% 年化）
+            rf_annual = 0.0
+            try:
+                rf_opt = jq_state.get('options', {}).get('risk_free_rate', 0.0)
+                if isinstance(rf_opt, (int, float)):
+                    rf_annual = float(rf_opt)
+            except Exception:
+                pass
+            rf_daily = (1.0 + rf_annual) ** (1.0 / trading_days) - 1.0
+
+            # 策略日收益序列（≥start）。Sharpe 默认包含首个样本；可通过 set_option('sharpe_exclude_first', True) 排除。
+            sr_all = [float(r) for dt, r in timereturn.items() if dt.strftime('%Y-%m-%d') >= start]
+            sharpe_exclude_first = False
+            try:
+                opt_ex_first = jq_state.get('options', {}).get('sharpe_exclude_first')
+                if isinstance(opt_ex_first, bool):
+                    sharpe_exclude_first = opt_ex_first
+            except Exception:
+                pass
+            sr_seq = (sr_all[1:] if len(sr_all) > 1 else list(sr_all)) if sharpe_exclude_first else list(sr_all)
+            ex_sr_all = [r - rf_daily for r in sr_seq]
+            # 夏普：sqrt(252) * mean(excess) / std(excess)
+            def _mean(vals: List[float]) -> float:
+                return sum(vals) / len(vals) if vals else 0.0
+            def _std(vals: List[float]) -> float:
+                n = len(vals)
+                if n <= 1:
+                    return 0.0
+                m = _mean(vals)
+                var = sum((x - m) ** 2 for x in vals) / (n - 1)
+                return var ** 0.5
+            # 使用样本标准差(ddof=1)作为波动，更贴近聚宽
+            n_ex = len(ex_sr_all)
+            sharpe_mean_excess = None
+            if n_ex > 1:
+                m_ex = _mean(ex_sr_all)
+                var_samp_ex = sum((x - m_ex) ** 2 for x in ex_sr_all) / (n_ex - 1)
+                std_ex_samp = (var_samp_ex ** 0.5)
+                if std_ex_samp > 0:
+                    sharpe_mean_excess = (_math.sqrt(trading_days) * m_ex / std_ex_samp)
+
+            # 可选：CAGR 口径
+            # 计算 CAGR
+            # CAGR 法基于同样的 sr_seq（已剔除首样本）
+            sharpe_jq = None
+            if sr_seq:
+                cum = 1.0
+                for r in sr_seq:
+                    cum *= (1.0 + r)
+                n = float(len(sr_seq))
+                r_annual_cagr = (cum ** (trading_days / n) - 1.0)
+                # 年化波动（样本标准差，ddof=1）
+                m = sum(sr_seq) / n
+                if len(sr_seq) > 1:
+                    var_samp = sum((r - m) ** 2 for r in sr_seq) / (len(sr_seq) - 1)
+                else:
+                    var_samp = 0.0
+                vol_annual = (_math.sqrt(var_samp) * _math.sqrt(trading_days)) if var_samp > 0 else 0.0
+                if vol_annual > 0:
+                    sharpe_jq = (r_annual_cagr - rf_annual) / vol_annual
+
+            # 选择输出口径：默认使用 mean-excess（日度均值法）更贴近聚宽；可通过 set_option('sharpe_method','mean'|'cagr') 切换
+            sharpe_method = None
+            try:
+                sm = jq_state.get('options', {}).get('sharpe_method')
+                if isinstance(sm, str):
+                    sharpe_method = sm.lower().strip()
+            except Exception:
+                sharpe_method = None
+            if not sharpe_method:
+                sharpe_method = 'mean'
+            if sharpe_method == 'cagr':
+                metrics['sharpe'] = sharpe_jq if (sharpe_jq is not None) else sharpe_mean_excess
+            else:
+                metrics['sharpe'] = sharpe_mean_excess if (sharpe_mean_excess is not None) else sharpe_jq
+            try:
+                jq_state['log'].append(
+                    f"[sharpe] method={sharpe_method or 'mean'} jq={sharpe_jq} mean_excess={sharpe_mean_excess} n={len(sr_seq)} ddof=1 exclude_first={sharpe_exclude_first}"
+                )
+            except Exception:
+                pass
+
+            # 使用 250 天年化计算策略年化收益（覆盖 BT Returns 的 rt_annual）
+            if sr_all:
+                total_cum = 1.0
+                for r in sr_all:
+                    total_cum *= (1.0 + r)
+                n = float(len(sr_all))
+                metrics['rt_annual'] = (total_cum ** (trading_days / n) - 1.0)
+            # 记录年化设置，便于审计
+            try:
+                jq_state['log'].append(f"[annualization] trading_days={int(trading_days)} rf_annual={rf_annual}")
+            except Exception:
+                pass
+
+            # 计算 α / β（Jensen α）：采用“原始日收益回归 + Rf 校正”，更贴近聚宽
+            if aligned_sr and aligned_br and len(aligned_sr) == len(aligned_br):
+                # α/β 使用“全部对齐样本”；Sharpe 根据上面选项决定是否排除首样本
+                Rs = list(map(float, aligned_sr))
+                Rb = list(map(float, aligned_br))
+                mb = _mean(Rb)
+                ms = _mean(Rs)
+                # 方差与协方差（样本）
+                def _cov(x: List[float], y: List[float]) -> float:
+                    n = min(len(x), len(y))
+                    if n <= 1:
+                        return 0.0
+                    mx = _mean(x)
+                    my = _mean(y)
+                    return sum((x[i]-mx)*(y[i]-my) for i in range(n)) / (n - 1)
+                var_b = _cov(Rb, Rb)
+                beta = (_cov(Rb, Rs) / var_b) if var_b > 0 else None
+                # 回归截距（原始收益）：intercept_raw = mean(Rs) - beta*mean(Rb)
+                intercept_raw = (ms - (beta * mb)) if (beta is not None) else None
+                # Jensen α（日度）：对截距进行 Rf 校正
+                # CAPM: Rs - Rf = α + β(Rb - Rf) => α = intercept_raw - (1-β) * Rf
+                alpha_daily = (intercept_raw - (1.0 - beta) * rf_daily) if (intercept_raw is not None and beta is not None) else None
+                # 年化 α（线性 × 250）
+                alpha_annual = (alpha_daily * trading_days) if (alpha_daily is not None) else None
+                metrics['beta'] = beta
+                metrics['alpha_daily'] = alpha_daily
+                metrics['alpha_annual'] = alpha_annual
+                # 输出口径：默认按年化显示，更贴近聚宽页面 α；可通过 set_option('alpha_unit','daily'|'annual') 切换
+                alpha_unit = 'annual'
+                try:
+                    au = jq_state.get('options', {}).get('alpha_unit')
+                    if isinstance(au, str) and au.lower() in ('daily', 'annual'):
+                        alpha_unit = au.lower()
+                except Exception:
+                    pass
+                metrics['alpha'] = alpha_annual if alpha_unit == 'annual' else alpha_daily
+                try:
+                    jq_state['log'].append(
+                        f"[alpha] model=raw+jensen unit={alpha_unit} daily={alpha_daily} annual={alpha_annual} beta={beta} rf_annual={rf_annual} n_align={len(aligned_sr)}"
+                    )
+                except Exception:
+                    pass
+            else:
+                metrics['beta'] = None
+                metrics['alpha'] = None
+                metrics['alpha_daily'] = None
+                metrics['alpha_annual'] = None
+        except Exception:
+            # 若计算失败，不影响回测其他结果
+            if 'beta' not in metrics:
+                metrics['beta'] = None
+            if 'alpha' not in metrics:
+                metrics['alpha'] = None
+
+        # 计算最大回撤区间（后端权威输出，避免不同前端实现差异）
+        try:
+            # 使用已归一的策略累计净值 equity_curve（>= start）
+            peak = -float('inf')
+            peak_date = None
+            min_dd = 0.0
+            trough_date = None
+            best_peak_date = None
+            eps = 1e-12  # 浮点容差
+            for p in (equity_curve or []):
+                val = float(p.get('equity', 0.0) or 0.0)
+                dt = p.get('date')
+                if val > peak:
+                    peak = val
+                    peak_date = dt
+                if peak > 0 and dt is not None:
+                    dd = val / peak - 1.0
+                    # 若出现相同的最小回撤（在容差内），选择更晚的谷底日期，贴近聚宽口径
+                    if (dd < min_dd - eps) or (abs(dd - min_dd) <= eps and (trough_date is None or (dt and dt > trough_date))):
+                        min_dd = dd
+                        trough_date = dt
+                        best_peak_date = peak_date
+            if trough_date and best_peak_date:
+                metrics['drawdown_interval'] = f"{best_peak_date} ~ {trough_date}"
+            else:
+                metrics['drawdown_interval'] = None
+        except Exception:
+            metrics['drawdown_interval'] = None
 
         # 回测结束，从 analyzer 里取交易记录 (包含已平仓 + 未平仓) 及订单级别明细
         trades: List[TradeRecord] = strat.analyzers.trade_capture.get_analysis() if hasattr(strat.analyzers, 'trade_capture') else []
