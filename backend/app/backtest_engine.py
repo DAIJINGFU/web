@@ -582,6 +582,17 @@ def run_backtest(
 
         preserved_suffixes = ('_daily', '_daily_qfq', '_daily_hfq', '_qfq', '_hfq', '_日', '_日_qfq', '_日_hfq')
 
+        # 允许通过 set_option('data_source_preference', ['_daily_qfq','_daily','_日']) 指定文件优先级
+        # 默认优先 qfq -> raw daily -> 中文“日”
+        def _get_data_source_preference() -> List[str]:
+            try:
+                pref = jq_state.get('options', {}).get('data_source_preference')
+                if isinstance(pref, (list, tuple)) and pref:
+                    return list(pref)
+            except Exception:
+                pass
+            return ['_daily_qfq', '_daily', '_日']
+
         def _map_security_code(code: str) -> str:
             c = code.strip()
             lower = c.lower()
@@ -589,7 +600,9 @@ def run_backtest(
                 return _normalize_existing(c.replace('.XSHE', '').replace('.XSHG', ''))
             if '.xshe' in lower or '.xshg' in lower:
                 base = c.split('.')[0]
-                candidates = [f"{base}_daily_qfq", f"{base}_daily", f"{base}_日"]
+                # 根据偏好顺序构建候选列表
+                pref = _get_data_source_preference()
+                candidates = [f"{base}{suf}" for suf in pref]
                 for fn in candidates:
                     if os.path.exists(os.path.join(datadir, fn + '.csv')):
                         return fn
@@ -603,7 +616,12 @@ def run_backtest(
                 return _normalize_existing(c.replace('.XSHE', '').replace('.XSHG', ''))
             if '.xshe' in lower or '.xshg' in lower:
                 base = c.split('.')[0]
-                candidates = [f"{base}_日", f"{base}_daily", f"{base}_daily_qfq"]
+                # 基准默认偏向中文“_日”，再 raw，再 qfq，除非用户有自定义
+                bench_pref = jq_state.get('options', {}).get('benchmark_source_preference')
+                if isinstance(bench_pref, (list, tuple)) and bench_pref:
+                    candidates = [f"{base}{suf}" for suf in bench_pref]
+                else:
+                    candidates = [f"{base}_日", f"{base}_daily", f"{base}_daily_qfq"]
                 for fn in candidates:
                     if os.path.exists(os.path.join(datadir, fn + '.csv')):
                         return fn
@@ -639,6 +657,9 @@ def run_backtest(
             pass
         warmup_start = (pd.to_datetime(start) - pd.Timedelta(days=lookback_days)).date().isoformat()
 
+        # 建立原始输入代码与映射后文件名的对应关系，便于 attribute_history 精确匹配
+        jq_state.setdefault('symbol_file_map', {})
+
         for i, sym in enumerate(symbols):
             dfeed = load_csv_data(sym, warmup_start, end, datadir)
             cerebro.adddata(dfeed, name=sym)
@@ -648,6 +669,12 @@ def run_backtest(
                 jq_state['history_df_map'][sym] = full_df
                 if i == 0:
                     jq_state['history_df'] = full_df
+                # 记录映射关系与所用数据文件到日志
+                try:
+                    jq_state['symbol_file_map'][symbols[i] if i < len(symbols) else sym] = sym
+                    jq_state['log'].append(f"[data_source] {symbols[i] if i < len(symbols) else sym} -> {sym}.csv")
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -813,7 +840,13 @@ def run_backtest(
                     name = None
                 # 将实际成交写入 JQ 日志，方便与期望价格核对
                 try:
-                    log_obj.info(f"[fill] {dt} {side} {name} size={abs(size)} price={price} value={value} commission={comm}")
+                    # 构造聚宽风格时间头（09:30:00）
+                    ts = f"{dt} 09:30:00" if dt else None
+                    line = f"[fill] {side} {name} size={abs(size)} price={price} value={value} commission={comm}"
+                    if ts:
+                        jq_state['log'].append(f"{ts} - INFO - {line}")
+                    else:
+                        jq_state['log'].append(line)
                 except Exception:
                     pass
                 self.records.append(OrderRecord(
