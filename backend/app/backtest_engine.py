@@ -584,8 +584,8 @@ def run_backtest(
 
         preserved_suffixes = ('_daily', '_daily_qfq', '_daily_hfq', '_qfq', '_hfq', '_日', '_日_qfq', '_日_hfq')
 
-        # 允许通过 set_option('data_source_preference', ['_daily_qfq','_daily','_日']) 指定文件优先级
-        # 默认优先 qfq -> raw daily -> 中文“日”
+        # 允许通过 set_option('data_source_preference', ['_daily','_daily_qfq','_日']) 指定文件优先级
+        # 默认优先 raw daily -> qfq -> 中文“日”（调换顺序以便默认成交价格与聚宽“前复权/不复权”设置保持一致，避免价格缩放导致下单金额差异）
         def _get_data_source_preference() -> List[str]:
             try:
                 pref = jq_state.get('options', {}).get('data_source_preference')
@@ -593,42 +593,102 @@ def run_backtest(
                     return list(pref)
             except Exception:
                 pass
-            return ['_daily_qfq', '_daily', '_日']
+            return ['_daily', '_daily_qfq', '_日']
+
+        def _strip_suffix(base: str) -> str:
+            b = base
+            for suf in preserved_suffixes:
+                if b.lower().endswith(suf):
+                    return b[: -len(suf)]
+            return b
+
+        def _pick_with_preference(base: str) -> str:
+            pref = _get_data_source_preference()
+            # 可选强制: set_option('force_data_variant','daily'|'qfq'|'hfq'|'日'|'raw')
+            try:
+                force = jq_state.get('options', {}).get('force_data_variant')
+            except Exception:
+                force = None
+            if isinstance(force, str):
+                vmap = {
+                    'daily': '_daily',
+                    'raw': '_daily',
+                    'qfq': '_daily_qfq',
+                    'hfq': '_daily_hfq',
+                    '日': '_日',
+                }
+                suf = vmap.get(force.strip().lower())
+                if suf:
+                    forced = f"{base}{suf}"
+                    if os.path.exists(os.path.join(datadir, forced + '.csv')):
+                        try:
+                            jq_state['log'].append(f"[data_source_force] using={forced}.csv by force_data_variant={force}")
+                        except Exception:
+                            pass
+                        return forced
+                    else:
+                        try:
+                            jq_state['log'].append(f"[data_source_force] missing={forced}.csv fallback_normal pref={pref}")
+                        except Exception:
+                            pass
+            candidates = [f"{base}{suf}" for suf in pref]
+            existence_desc = []
+            chosen = None
+            for fn in candidates:
+                exists = os.path.exists(os.path.join(datadir, fn + '.csv'))
+                existence_desc.append(f"{fn}:{'Y' if exists else 'N'}")
+                if exists and chosen is None:
+                    chosen = fn
+            try:
+                jq_state['log'].append(
+                    f"[data_source_scan] base={base} candidates={'|'.join(existence_desc)} selected={chosen or 'NONE'}"
+                )
+            except Exception:
+                pass
+            if chosen:
+                return chosen
+            # 全部不存在，回退首个候选名（即使不存在，后续会抛出文件未找到错误）
+            return candidates[0]
 
         def _map_security_code(code: str) -> str:
             c = code.strip()
             lower = c.lower()
-            if any(lower.endswith(suf) for suf in preserved_suffixes):
-                return _normalize_existing(c.replace('.XSHE', '').replace('.XSHG', ''))
-            if '.xshe' in lower or '.xshg' in lower:
-                base = c.split('.')[0]
-                # 根据偏好顺序构建候选列表
-                pref = _get_data_source_preference()
-                candidates = [f"{base}{suf}" for suf in pref]
-                for fn in candidates:
-                    if os.path.exists(os.path.join(datadir, fn + '.csv')):
-                        return fn
-                return candidates[0]
-            return c
+            # 去掉市场后缀 .XSHE/.XSHG
+            c_no_market = c.replace('.XSHE', '').replace('.XSHG', '').replace('.xshe', '').replace('.xshg', '')
+            # 无论是否已经带复权/日线后缀，都剥离再按优先级重选
+            core = _strip_suffix(c_no_market)
+            return _pick_with_preference(core)
 
         def _map_benchmark_code(code: str) -> str:
             c = code.strip()
-            lower = c.lower()
-            if any(lower.endswith(suf) for suf in preserved_suffixes):
-                return _normalize_existing(c.replace('.XSHE', '').replace('.XSHG', ''))
-            if '.xshe' in lower or '.xshg' in lower:
-                base = c.split('.')[0]
-                # 基准默认偏向中文“_日”，再 raw，再 qfq，除非用户有自定义
-                bench_pref = jq_state.get('options', {}).get('benchmark_source_preference')
-                if isinstance(bench_pref, (list, tuple)) and bench_pref:
-                    candidates = [f"{base}{suf}" for suf in bench_pref]
-                else:
-                    candidates = [f"{base}_日", f"{base}_daily", f"{base}_daily_qfq"]
-                for fn in candidates:
-                    if os.path.exists(os.path.join(datadir, fn + '.csv')):
-                        return fn
-                return candidates[0]
-            return c
+            # 去市场后缀
+            c_no_market = c.replace('.XSHE', '').replace('.XSHG', '').replace('.xshe', '').replace('.xshg', '')
+            # 基准允许单独的 benchmark_source_preference 定义；若无则使用专用序列
+            bench_pref = jq_state.get('options', {}).get('benchmark_source_preference')
+            if isinstance(bench_pref, (list, tuple)) and bench_pref:
+                pref_list = list(bench_pref)
+            else:
+                # 默认：中文“_日” 优先，再 raw，再 qfq
+                pref_list = ['_日', '_daily', '_daily_qfq']
+            # 剥后缀再重选
+            core = _strip_suffix(c_no_market)
+            candidates = [f"{core}{suf}" for suf in pref_list]
+            existence_desc = []
+            chosen = None
+            for fn in candidates:
+                exists = os.path.exists(os.path.join(datadir, fn + '.csv'))
+                existence_desc.append(f"{fn}:{'Y' if exists else 'N'}")
+                if exists and chosen is None:
+                    chosen = fn
+            try:
+                jq_state['log'].append(
+                    f"[benchmark_source_scan] base={core} candidates={'|'.join(existence_desc)} selected={chosen or 'NONE'}"
+                )
+            except Exception:
+                pass
+            if chosen:
+                return chosen
+            return candidates[0]
 
         symbols: List[str] = []
         g_sec = getattr(jq_state.get('g'), 'security', None)
@@ -663,6 +723,19 @@ def run_backtest(
         jq_state.setdefault('symbol_file_map', {})
 
         for i, sym in enumerate(symbols):
+            # 强制优先使用未复权 raw 日线: 若当前选择为 _daily_qfq 且存在对应 _daily 文件，则切换
+            try:
+                if sym.endswith('_daily_qfq'):
+                    raw_candidate = sym[:-len('_daily_qfq')] + '_daily'
+                    raw_path = os.path.join(datadir, raw_candidate + '.csv')
+                    if os.path.exists(raw_path):
+                        jq_state['log'].append(
+                            f"[data_source_override] switch {sym} -> {raw_candidate} (raw daily present)"
+                        )
+                        symbols[i] = raw_candidate
+                        sym = raw_candidate
+            except Exception:
+                pass
             dfeed = load_csv_data(sym, warmup_start, end, datadir)
             cerebro.adddata(dfeed, name=sym)
             # 缓存完整历史（用于 attribute_history）
@@ -674,7 +747,7 @@ def run_backtest(
                 # 记录映射关系与所用数据文件到日志
                 try:
                     jq_state['symbol_file_map'][symbols[i] if i < len(symbols) else sym] = sym
-                    jq_state['log'].append(f"[data_source] {symbols[i] if i < len(symbols) else sym} -> {sym}.csv")
+                    jq_state['log'].append(f"[data_source] load={sym}.csv pref={_get_data_source_preference()}")
                 except Exception:
                     pass
             except Exception:
@@ -941,6 +1014,9 @@ def run_backtest(
             'symbols_used': symbols,
             'use_real_price': bool(use_real_price_opt),
             'jq_options': jq_state.get('options', {}) if 'jq_state' in locals() else {},
+            # 追踪数据源：展示偏好与实际加载的文件映射
+            'data_source_preference': None,
+            'data_sources_used': None,
         }
 
         # 基准 & 超额
@@ -1048,6 +1124,12 @@ def run_backtest(
         metrics['benchmark_code'] = jq_state.get('benchmark') if 'jq_state' in locals() else None
         if 'benchmark_detect_phase' not in metrics:
             metrics['benchmark_detect_phase'] = 'none'
+        # 回填数据源偏好与实际文件
+        try:
+            metrics['data_source_preference'] = jq_state.get('options', {}).get('data_source_preference') or ['_daily', '_daily_qfq', '_日']
+            metrics['data_sources_used'] = jq_state.get('symbol_file_map')
+        except Exception:
+            pass
 
         # 重新计算并覆盖夏普；计算 α/β（CAPM，默认 Rf=3% 年化，可通过 set_option('risk_free_rate') 年化设定）
         try:

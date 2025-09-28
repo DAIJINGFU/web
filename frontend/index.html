@@ -1069,6 +1069,21 @@ class UserStrategy(bt.Strategy):
           document.getElementById("periodBadge").textContent =
             start + " ~ " + end;
         } else document.getElementById("periodBadge").textContent = "";
+        // 新增：根据后端实际加载的数据文件映射显示解析标的
+        try {
+          const usedMap =
+            (data.metrics && data.metrics.data_sources_used) || null;
+          if (usedMap && typeof usedMap === "object") {
+            const actualSymbols = Object.values(usedMap);
+            if (Array.isArray(actualSymbols) && actualSymbols.length) {
+              // 去重
+              const uniq = Array.from(new Set(actualSymbols));
+              renderParsedSymbols(uniq);
+            }
+          }
+        } catch (e) {
+          console.warn("render actual symbols failed", e);
+        }
       }
 
       function renderJQLogs(lines) {

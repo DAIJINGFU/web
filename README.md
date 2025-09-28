@@ -110,6 +110,7 @@ uvicorn backend.app.main:app --reload
 页面左边填写:
 
 - symbol: 如 `000516_daily` (对应文件 `data/000516_daily.csv`)
+
 # Web Backtest Demo
 
 ## 对齐聚宽指标口径（Sharpe/Alpha）
@@ -117,9 +118,9 @@ uvicorn backend.app.main:app --reload
 为使本地回测的夏普比率与阿尔法尽量贴近聚宽（JoinQuant）的展示口径，后端已做如下处理：
 
 - 阿尔法/贝塔：采用日度收益对齐基准后做线性回归，再按 Jensen α 进行 Rf 校正；阿尔法默认按年化（× 年化因子）输出。
- 无风险利率：默认 4% 年化（0.04），可通过 set_option('risk_free_rate', 0.04) 调整。
- 夏普计算：默认使用“CAGR 年化口径”（Rp年化与波动年化的标准 Sharpe 形式），也支持“日度超额收益均值法”。
- 可通过 set_option('sharpe_method', 'cagr'|'mean') 切换（默认 cagr）。
+  无风险利率：默认 4% 年化（0.04），可通过 set_option('risk_free_rate', 0.04) 调整。
+  夏普计算：默认使用“CAGR 年化口径”（Rp 年化与波动年化的标准 Sharpe 形式），也支持“日度超额收益均值法”。
+  可通过 set_option('sharpe_method', 'cagr'|'mean') 切换（默认 cagr）。
 
 在策略代码（无论 backtrader 或聚宽风格）中，可以直接调用这些选项：
 
