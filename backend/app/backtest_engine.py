@@ -1,6 +1,7 @@
 import io
 import json
 import traceback
+import re
 import types
 import os
 from dataclasses import dataclass, asdict
@@ -404,40 +405,115 @@ def compile_user_strategy(code: str):
                     return _JQDataFrame(_pd.DataFrame(data_dict, index=str_idx))
 
                 def order_value(security: str, value: float):
-                    # 暖场期不交易
-                    if exec_env['jq_state'].get('in_warmup'):
-                        return
-                    # 成交定价策略：默认 'open'（聚宽日频），可通过 set_option('fill_price', 'close') 切换
-                    fill_price = str(exec_env['jq_state']['options'].get('fill_price', 'open')).lower() if 'jq_state' in exec_env else 'open'
-                    if fill_price == 'close':
-                        chosen_price = getattr(self.data, 'close')[0]
-                    else:
-                        chosen_price = getattr(self.data, 'open')[0] if hasattr(self.data, 'open') else getattr(self.data, 'close')[0]
-                    if chosen_price <= 0:
-                        return
-                    # 支持正负 value：正为买入金额，负为卖出金额
-                    size_raw = int(value / chosen_price)
-                    # A股规则：股数需为100的整数倍
-                    lot = int(exec_env['jq_state']['options'].get('lot', 100)) if 'jq_state' in exec_env else 100
-                    adj = (abs(size_raw) // lot) * lot
-                    size = adj if size_raw >= 0 else -adj
-                    if size_raw != 0 and abs(size) != abs(size_raw):
-                        # 打印与聚宽类似的提示
+                    """按金额下单（聚宽语义近似）：
+                    value > 0  -> 期望用不超过 value 的现金买入；若 value 超过可用现金则用全部可用现金。
+                    value < 0  -> 期望按金额卖出（减仓）不超过 abs(value)；受持仓限制。
+
+                    与原简单实现差异：
+                    1. 计算时考虑佣金率/最小佣金，确保 (成交额+佣金)<=目标金额；
+                    2. 买入时不超出可用现金 (cash)；
+                    3. 卖出时不超过当前持仓市值；
+                    4. 使用 lot(默认100) 对齐；
+                    5. 记录详细计算日志，便于对齐聚宽第二笔差异。
+                    """
+                    try:
+                        if exec_env['jq_state'].get('in_warmup'):
+                            return
+                        jqst = exec_env['jq_state']
+                        fill_price = str(jqst['options'].get('fill_price', 'open')).lower()
+                        if fill_price == 'close':
+                            price = float(getattr(self.data, 'close')[0])
+                        else:
+                            price = float(getattr(self.data, 'open')[0]) if hasattr(self.data, 'open') else float(getattr(self.data, 'close')[0])
+                        if price <= 0:
+                            return
+                        lot = int(jqst['options'].get('lot', 100)) or 100
+                        fee_cfg = jqst.get('fee_config', {})
+                        rate = float(fee_cfg.get('rate', 0.0))
+                        min_commission = float(fee_cfg.get('min_commission', 0.0))
+                        # stamp_duty 仅用于卖出估算（买入不计）
+                        stamp_duty_rate = float(fee_cfg.get('stamp_duty', 0.0))
+                        broker_cash = float(self.broker.getcash())
+                        pos_size = int(getattr(self.position, 'size', 0) or 0)
+                        side = 'BUY' if value >= 0 else 'SELL'
+                        target_amt = abs(float(value))
+                        # BUY 分支
+                        if side == 'BUY':
+                            # 实际可用目标金额不超过现金
+                            target_amt = min(target_amt, broker_cash)
+                            if target_amt <= 0:
+                                return
+                            # 初步忽略最小佣金，粗估 shares
+                            if rate < 0:
+                                rate = 0.0
+                            # 估算函数：在 (shares*price + commission)<=target_amt 下最大 shares
+                            def _max_shares(amount: float) -> int:
+                                if amount <= 0 or price <= 0:
+                                    return 0
+                                # 初步估算 (忽略最小佣金)
+                                guess = int(amount / (price * (1 + max(rate, 0))))
+                                if guess < 0:
+                                    guess = 0
+                                # lot 对齐
+                                guess = (guess // lot) * lot
+                                # 回退调整，确保费用后不超额
+                                while guess > 0:
+                                    comm = max(min_commission, guess * price * rate)
+                                    gross = guess * price + comm  # 买入不含印花税
+                                    if gross <= amount + 1e-9:  # 容差
+                                        return guess
+                                    guess -= lot
+                                return 0
+                            shares = _max_shares(target_amt)
+                            if shares <= 0:
+                                exec_env['log'].info(f"[order_value_calc] side=BUY insufficient target_amt={target_amt:.2f} cash={broker_cash:.2f}")
+                                return
+                            comm_final = max(min_commission, shares * price * rate)
+                            gross_final = shares * price + comm_final
+                            leftover = broker_cash - gross_final
+                            exec_env['log'].info(
+                                f"[order_value_calc] side=BUY price={price:.4f} target={abs(value):.2f} cash={broker_cash:.2f} shares={shares} gross={shares*price:.2f} comm={comm_final:.2f} leftover={leftover:.2f} lot={lot}"
+                            )
+                            if shares > 0:
+                                self.buy(size=shares)
+                            return
+                        # SELL 分支
+                        if pos_size <= 0:
+                            return
+                        # 限制最大可卖市值
+                        max_sell_value = pos_size * price
+                        target_amt = min(target_amt, max_sell_value)
+                        if target_amt <= 0:
+                            return
+                        # shares 估算：卖出所得 = shares*price - commission - stamp_duty*shares*price >= target_amt? 但聚宽 order_value(value<0) 更像按“成交额”近似；
+                        # 我们按“想减仓的市值”来反推 shares，使 shares*price ≈ target_amt，不超出持仓。
+                        shares = int(target_amt / price)
+                        shares = min(shares, pos_size)
+                        shares = (shares // lot) * lot
+                        if shares <= 0:
+                            return
+                        # 重新估算若加入费用是否明显偏离；若偏离太多且仍可再卖出一个 lot 则调整
+                        def _sell_net(sh):
+                            gross = sh * price
+                            comm = max(min_commission, gross * rate)
+                            tax = gross * stamp_duty_rate
+                            return gross - comm - tax, gross, comm, tax
+                        # 尝试向上补一个 lot 如果未超持仓且净额仍 <= target_amt*(1+0.01) （允许1%偏差）
+                        net, gross, comm, tax = _sell_net(shares)
+                        if shares + lot <= pos_size:
+                            net2, gross2, comm2, tax2 = _sell_net(shares + lot)
+                            if net2 <= target_amt * 1.01:
+                                shares += lot
+                                net, gross, comm, tax = net2, gross2, comm2, tax2
+                        exec_env['log'].info(
+                            f"[order_value_calc] side=SELL price={price:.4f} target={abs(value):.2f} pos_val={pos_size*price:.2f} shares={shares} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} lot={lot}" )
+                        if shares > 0:
+                            self.sell(size=shares)
+                    except Exception as _e:
                         try:
-                            exec_env['log'].info(f"[order_value] 数量需为 {lot} 的整数倍，调整为 {abs(size)}")
+                            exec_env['log'].info(f"[order_value_error] {type(_e).__name__}:{_e}")
                         except Exception:
                             pass
-                    # 记录下单定价与数量，便于核对现金差异
-                    try:
-                        exec_env['log'].info(f"[order_value] price={chosen_price:.4f} final_size={size}")
-                    except Exception:
-                        pass
-                    if size == 0:
-                        return
-                    if size > 0:
-                        self.buy(size=size)
-                    else:
-                        self.sell(size=abs(size))
 
                 def order_target(security: str, target: float):
                     # 暖场期不交易
@@ -555,6 +631,42 @@ def run_backtest(
     try:
         # 1. 编译策略 & 初始化 Cerebro
         StrategyCls, jq_state = compile_user_strategy(strategy_code)
+        # 1.1 预解析 set_option 影响数据源的键（如果用户把 set_option 放在 initialize 里，我们在数据加载前仍需获知）
+        try:
+            import re
+            pattern = re.compile(r"set_option\s*\(\s*(['\"])\s*(use_real_price|adjust_type)\s*\1\s*,\s*([^\)]*)\)")
+            for m in pattern.finditer(strategy_code):
+                key = m.group(2).strip()
+                raw_val = m.group(3).strip()
+                val_parsed = raw_val
+                # 去掉尾部注释
+                if '#' in val_parsed:
+                    val_parsed = val_parsed.split('#',1)[0].strip()
+                # 简单字面值解析
+                if val_parsed.lower() in ('true','false'):
+                    val = val_parsed.lower() == 'true'
+                elif val_parsed in ('1','0'):
+                    val = (val_parsed == '1')
+                elif (val_parsed.startswith("'") and val_parsed.endswith("'")) or (val_parsed.startswith('"') and val_parsed.endswith('"')):
+                    val = val_parsed[1:-1]
+                else:
+                    # 尝试数值
+                    try:
+                        val = int(val_parsed)
+                    except Exception:
+                        try:
+                            val = float(val_parsed)
+                        except Exception:
+                            val = val_parsed
+                # 只在尚未用户顶层设置时进行覆盖，避免顶层 set_option 已生效
+                if key not in jq_state['options']:
+                    jq_state['options'][key] = val
+                    try:
+                        jq_state['log'].append(f"[pre_parse_option] {key}={val}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # 记录用户开始日期，供暖场/日志用
         jq_state['user_start'] = start
         # 根据 fill_price 决定是否启用 cheat-on-open（保证当日开盘撮合）
@@ -584,6 +696,51 @@ def run_backtest(
 
         preserved_suffixes = ('_daily', '_daily_qfq', '_daily_hfq', '_qfq', '_hfq', '_日', '_日_qfq', '_日_hfq')
 
+        # 调试：列出 datadir 中的相关文件（只列与当前 symbol 参数前三个代码字符匹配的，避免过长）
+        try:
+            _all_files = []
+            for nm in os.listdir(datadir):
+                if nm.lower().endswith('.csv'):
+                    _all_files.append(nm)
+            _preview = sorted([f for f in _all_files if f[:3].isdigit()])[:40]
+            jq_state['log'].append(f"[data_dir_snapshot] total_csv={len(_all_files)} sample={','.join(_preview)}")
+        except Exception:
+            pass
+
+        # 复权类型支持：set_option('adjust_type', 'auto'|'raw'|'qfq'|'hfq')
+        # 语义：
+        #   raw: 优先未复权(_daily / _日)；找不到再回退 qfq/hfq
+        #   qfq: 强制选前复权(_daily_qfq 或 _日_qfq) 若存在；否则回退 raw
+        #   hfq: 强制选后复权(_daily_hfq 或 _日_hfq) 若存在；否则回退 raw
+        #   auto(默认): 若 use_real_price=True 则 raw；否则前复权 qfq（贴近聚宽动态复权 vs 前复权界面含义）
+        def _get_adjust_type() -> str:
+            at = None
+            try:
+                at = jq_state.get('options', {}).get('adjust_type')
+            except Exception:
+                at = None
+            if isinstance(at, str) and at.lower() in ('raw','qfq','hfq','auto'):
+                return at.lower()
+            return 'auto'
+
+        def _resolve_adjust_pref(core: str) -> List[str]:
+            # 根据 adjust_type 生成一个候选后缀序列（不含 benchmark 专用优先顺序）
+            at = _get_adjust_type()
+            use_real_price_flag = bool(jq_state.get('options', {}).get('use_real_price', False))
+            # 日线两种命名族：英文 _daily* 与 中文 *_日* ，我们组合时保持与 data_source_preference 的通用后缀可兼容
+            if at == 'raw':
+                return ['_daily','_日','_daily_qfq','_日_qfq','_daily_hfq','_日_hfq']
+            if at == 'qfq':
+                return ['_daily_qfq','_日_qfq','_daily','_日','_daily_hfq','_日_hfq']
+            if at == 'hfq':
+                return ['_daily_hfq','_日_hfq','_daily','_日','_daily_qfq','_日_qfq']
+            # auto:
+            if use_real_price_flag:
+                # 动态复权语义 -> 真实未复权价格下单
+                return ['_daily','_日','_daily_qfq','_日_qfq','_daily_hfq','_日_hfq']
+            # 非真实价格 -> 前复权优先
+            return ['_daily_qfq','_日_qfq','_daily','_日','_daily_hfq','_日_hfq']
+
         # 允许通过 set_option('data_source_preference', ['_daily','_daily_qfq','_日']) 指定文件优先级
         # 默认优先 raw daily -> qfq -> 中文“日”（调换顺序以便默认成交价格与聚宽“前复权/不复权”设置保持一致，避免价格缩放导致下单金额差异）
         def _get_data_source_preference() -> List[str]:
@@ -603,20 +760,25 @@ def run_backtest(
             return b
 
         def _pick_with_preference(base: str) -> str:
-            pref = _get_data_source_preference()
-            # 可选强制: set_option('force_data_variant','daily'|'qfq'|'hfq'|'日'|'raw')
+            # 合并用户 data_source_preference 与 adjust_type 推导出的顺序：
+            # 逻辑：以 adjust 序列为主；若用户自定义 data_source_preference 则将其插入到 adjust 末尾去重保序。
+            adj_seq = _resolve_adjust_pref(base)
+            user_pref = _get_data_source_preference()  # 原默认 ['_daily','_daily_qfq','_日']
+            # 构建最终序列（后缀层面去重）
+            seen = set()
+            merged_suffixes: List[str] = []
+            for suf in adj_seq + user_pref:
+                if suf not in seen:
+                    seen.add(suf)
+                    merged_suffixes.append(suf)
+            # 支持 force_data_variant 继续硬指定（保留原能力）
+            force = None
             try:
                 force = jq_state.get('options', {}).get('force_data_variant')
             except Exception:
                 force = None
             if isinstance(force, str):
-                vmap = {
-                    'daily': '_daily',
-                    'raw': '_daily',
-                    'qfq': '_daily_qfq',
-                    'hfq': '_daily_hfq',
-                    '日': '_日',
-                }
+                vmap = {'daily':'_daily','raw':'_daily','qfq':'_daily_qfq','hfq':'_daily_hfq','日':'_日'}
                 suf = vmap.get(force.strip().lower())
                 if suf:
                     forced = f"{base}{suf}"
@@ -628,10 +790,10 @@ def run_backtest(
                         return forced
                     else:
                         try:
-                            jq_state['log'].append(f"[data_source_force] missing={forced}.csv fallback_normal pref={pref}")
+                            jq_state['log'].append(f"[data_source_force] missing={forced}.csv fallback merged_suffixes={merged_suffixes}")
                         except Exception:
                             pass
-            candidates = [f"{base}{suf}" for suf in pref]
+            candidates = [f"{base}{suf}" for suf in merged_suffixes]
             existence_desc = []
             chosen = None
             for fn in candidates:
@@ -639,16 +801,30 @@ def run_backtest(
                 existence_desc.append(f"{fn}:{'Y' if exists else 'N'}")
                 if exists and chosen is None:
                     chosen = fn
+            # 若首候选存在却没有被选（理论上不会发生），输出警告
+            try:
+                first_candidate_path = os.path.join(datadir, candidates[0] + '.csv')
+                if os.path.exists(first_candidate_path) and chosen != candidates[0]:
+                    jq_state['log'].append(
+                        f"[adjust_warning] first_candidate_exists_but_not_chosen first={candidates[0]} chosen={chosen}"
+                    )
+            except Exception:
+                pass
             try:
                 jq_state['log'].append(
-                    f"[data_source_scan] base={base} candidates={'|'.join(existence_desc)} selected={chosen or 'NONE'}"
+                    f"[data_source_scan] adjust_type={_get_adjust_type()} base={base} candidates={'|'.join(existence_desc)} selected={chosen or 'NONE'} merged_suffixes={'|'.join(merged_suffixes)}"
+                )
+                # 更精确的决策审计
+                try:
+                    use_real_price_flag = bool(jq_state.get('options', {}).get('use_real_price', False))
+                except Exception:
+                    use_real_price_flag = False
+                jq_state['log'].append(
+                    f"[adjust_resolve] base={base} adjust_type={_get_adjust_type()} use_real_price={use_real_price_flag} sequence={'|'.join(merged_suffixes)} chosen={chosen or candidates[0]}"
                 )
             except Exception:
                 pass
-            if chosen:
-                return chosen
-            # 全部不存在，回退首个候选名（即使不存在，后续会抛出文件未找到错误）
-            return candidates[0]
+            return chosen or candidates[0]
 
         def _map_security_code(code: str) -> str:
             c = code.strip()
@@ -702,7 +878,34 @@ def run_backtest(
                 symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             else:
                 symbols = list(symbol)
-        symbols = list(dict.fromkeys(symbols))  # 去重保持顺序
+        # 记录原始输入
+        try:
+            jq_state['log'].append(f"[symbol_input] raw={symbols}")
+        except Exception:
+            pass
+        # 若未设置 explicit 尊重后缀，则统一走映射流程（这样前端输入 '000514_daily_qfq' 仍可在 use_real_price/raw 场景下选到 _daily）。
+        respect_suffix = False
+        try:
+            opt = jq_state.get('options', {}).get('respect_symbol_suffix')
+            if isinstance(opt, bool):
+                respect_suffix = opt
+        except Exception:
+            pass
+        mapped_syms: List[str] = []
+        for s in symbols:
+            if respect_suffix:
+                mapped_syms.append(s)
+            else:
+                # 剥后缀重选（允许用户直接传 qfq 仍由 adjust_type 决策）
+                try:
+                    mapped_syms.append(_map_security_code(s))
+                except Exception:
+                    mapped_syms.append(s)
+        symbols = list(dict.fromkeys(mapped_syms))  # 去重保持顺序
+        try:
+            jq_state['log'].append(f"[symbol_mapped] final={symbols} respect_suffix={respect_suffix}")
+        except Exception:
+            pass
         if not symbols:
             raise ValueError('未指定任何标的: 请在策略 g.security 或 表单 symbol 提供至少一个')
 
@@ -723,19 +926,7 @@ def run_backtest(
         jq_state.setdefault('symbol_file_map', {})
 
         for i, sym in enumerate(symbols):
-            # 强制优先使用未复权 raw 日线: 若当前选择为 _daily_qfq 且存在对应 _daily 文件，则切换
-            try:
-                if sym.endswith('_daily_qfq'):
-                    raw_candidate = sym[:-len('_daily_qfq')] + '_daily'
-                    raw_path = os.path.join(datadir, raw_candidate + '.csv')
-                    if os.path.exists(raw_path):
-                        jq_state['log'].append(
-                            f"[data_source_override] switch {sym} -> {raw_candidate} (raw daily present)"
-                        )
-                        symbols[i] = raw_candidate
-                        sym = raw_candidate
-            except Exception:
-                pass
+            # 不再无条件覆盖 qfq -> raw；完全由 adjust_type 和 force_data_variant 控制
             dfeed = load_csv_data(sym, warmup_start, end, datadir)
             cerebro.adddata(dfeed, name=sym)
             # 缓存完整历史（用于 attribute_history）
@@ -760,8 +951,41 @@ def run_backtest(
             # 默认按照 0.03% 佣金，贴近聚宽
             commission = 0.0003
             jq_state['options']['commission'] = commission
+        # 统一手续费模型（默认即聚宽风格）：
+        # 始终使用 rate=commission (默认0.0003)、单笔最小佣金5元、卖出印花税0.001；
+        # 用户可通过 set_option 覆盖：commission / min_commission / stamp_duty。
+        # 移除 fee_model 分支，保持逻辑简洁且确定性。
+        try:
+            jq_state['log'].append(f"[commission_setup] rate={commission} model=unified")
+        except Exception:
+            pass
         try:
             cerebro.broker.setcommission(commission=commission)
+        except Exception:
+            pass
+        jq_state.setdefault('fee_config', {})
+        cfg = jq_state['fee_config']
+        cfg['rate'] = commission
+        # 默认值
+        min_comm = 5.0
+        stamp_duty = 0.001
+        # 用户覆盖
+        try:
+            user_min = jq_state.get('options', {}).get('min_commission')
+            if isinstance(user_min, (int, float)) and user_min >= 0:
+                min_comm = float(user_min)
+        except Exception:
+            pass
+        try:
+            user_sd = jq_state.get('options', {}).get('stamp_duty')
+            if isinstance(user_sd, (int, float)) and user_sd >= 0:
+                stamp_duty = float(user_sd)
+        except Exception:
+            pass
+        cfg['min_commission'] = min_comm
+        cfg['stamp_duty'] = stamp_duty
+        try:
+            jq_state['log'].append(f"[fee_config] min_commission={min_comm} stamp_duty={stamp_duty}")
         except Exception:
             pass
         slippage_perc = jq_state.get('options', {}).get('slippage_perc')
@@ -913,6 +1137,38 @@ def run_backtest(
                     name = getattr(data, '_name', None)
                 except Exception:
                     name = None
+                # 二次费用调整（最小佣金 + 印花税）
+                try:
+                    fee_cfg = jq_state.get('fee_config', {})
+                    rate = float(fee_cfg.get('rate', 0.0))
+                    min_comm = float(fee_cfg.get('min_commission', 0.0))
+                    stamp_duty = float(fee_cfg.get('stamp_duty', 0.0)) if side == 'SELL' else 0.0
+                    if value is not None:
+                        raw_comm = abs(value) * rate
+                        # Backtrader 已经按照 rate 计算过 comm（近似 raw_comm），我们做调整：
+                        # 1) 重新计算标准佣金 raw_comm
+                        # 2) 应用最小佣金
+                        adj_comm = raw_comm
+                        if min_comm > 0 and adj_comm < min_comm:
+                            adj_comm = min_comm
+                        total_fee = adj_comm + abs(value) * stamp_duty
+                        # 更新 order.executed 的 comm（注意可能无写权限，捕获异常）
+                        delta = total_fee - comm
+                        if abs(delta) > 1e-9:
+                            try:
+                                order.executed.comm = total_fee
+                                comm = total_fee
+                            except Exception:
+                                comm = total_fee
+                        # 费用日志
+                        try:
+                            jq_state['log'].append(
+                                f"[fee] {side} {name} value={value:.2f} price={price:.4f} base_comm={raw_comm:.4f} adj_comm={adj_comm:.4f} stamp_duty={(abs(value)*stamp_duty):.4f} final_comm={comm:.4f}"
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 # 将实际成交写入 JQ 日志，方便与期望价格核对
                 try:
                     # 构造聚宽风格时间头（09:30:00）
@@ -1017,6 +1273,7 @@ def run_backtest(
             # 追踪数据源：展示偏好与实际加载的文件映射
             'data_source_preference': None,
             'data_sources_used': None,
+            'adjust_type': None,
         }
 
         # 基准 & 超额
@@ -1128,6 +1385,7 @@ def run_backtest(
         try:
             metrics['data_source_preference'] = jq_state.get('options', {}).get('data_source_preference') or ['_daily', '_daily_qfq', '_日']
             metrics['data_sources_used'] = jq_state.get('symbol_file_map')
+            metrics['adjust_type'] = _get_adjust_type()
         except Exception:
             pass
 

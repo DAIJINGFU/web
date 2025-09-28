@@ -218,3 +218,157 @@ def handle_data(context, data):
 - attribute_history: 仅日级, 返回负索引 DataFrame, `df['close'][-1]` 可直接取最新值。
 - record()/log.info(): 结果中以 `jq_records`, `jq_logs` 返回，并在前端显示最近记录。
 - 手续费/滑点: 可在 initialize 里使用 `set_option('commission', 0.0003)` 与 `set_option('slippage_perc', 0.0005)`。
+
+## 手续费模型（统一聚宽风格默认）
+
+当前版本已简化为单一确定性手续费逻辑（不再需要 `fee_model='jq'`）：
+
+默认规则：
+
+- 佣金率 (commission)：0.0003 （双边）
+- 单笔最小佣金 (min_commission)：5 元
+- 卖出印花税 (stamp_duty)：0.001 （仅卖出单边征收）
+- 滑点：可选 `slippage_perc` 百分比滑点（若设置则按成交金额 \* 百分比体现在成交价的偏移，或依据 backtrader 的内置实现）
+
+可覆盖的选项（在策略 `initialize` 或顶层放置）：
+
+```python
+set_option('commission', 0.00025)      # 调整佣金率
+set_option('min_commission', 3)        # 调整最小单笔佣金（>=0）
+set_option('stamp_duty', 0.001)        # 调整卖出印花税（>=0）
+set_option('slippage_perc', 0.0005)    # 成交滑点百分比（示例 5bp）
+```
+
+运行期日志中会出现：
+
+```
+[commission_setup] rate=0.0003 model=unified
+[fee_config] min_commission=5.0 stamp_duty=0.001
+[fee] BUY  000516_daily ... base_comm=xx adj_comm=xx stamp_duty=0.0000 final_comm=xx
+[fee] SELL 000516_daily ... base_comm=xx adj_comm=xx stamp_duty=yy   final_comm=xx
+```
+
+计算说明：
+
+1. Backtrader 先按 `value * commission` 生成基础佣金。
+2. 二次调整：若 < `min_commission` 则提升到最小值。
+3. 若为卖出单，则加上 `value * stamp_duty`。
+4. 最终 `commission` 字段写回订单执行对象，影响 `pnlcomm`。
+
+常见验证步骤：
+
+- 极小金额买入：确认佣金被抬到 5 元。
+- 卖出同等金额：确认在 5 元基础上再加印花税。
+- 调整 `min_commission` 为 0：验证小额交易佣金按比例走。
+- 调整 `stamp_duty` 为 0：验证卖出与买入费用对称。
+
+和聚宽可能仍存在的差异：
+
+- 聚宽可能对分笔成交、撮合时点、成本价四舍五入存在额外规则；这里按单笔一次性撮合。
+- 未模拟融资融券、分红派息、手续费折扣等高级场景。
+
+如果需要扩展更多费率层（如阶梯费率、不同市场不同费率），可在 `backtest_engine.py` 中对 `fee_config` 增加结构，再在 `OrderCapture.notify_order` 里细分逻辑。
+
+## 数据源与复权模式 (adjust_type) ✅
+
+为复刻聚宽在 `set_option('use_real_price', True/False)` 与不同复权数据（未复权 / 前复权 / 后复权）下的下单差异，后端实现了可配置复权类型解析：
+
+支持的文件命名（放置于 `data/` 目录）：
+
+```
+<code>_daily.csv         # 未复权 (英文后缀)
+<code>_日.csv            # 未复权 (中文后缀)
+<code>_daily_qfq.csv     # 前复权
+<code>_日_qfq.csv
+<code>_daily_hfq.csv     # 后复权
+<code>_日_hfq.csv
+```
+
+### 1. 选项说明
+
+```python
+set_option('adjust_type', 'auto')   # 'auto' | 'raw' | 'qfq' | 'hfq'
+set_option('use_real_price', True)  # 是否使用真实未复权价撮合（聚宽语义）
+
+# 可选：控制候选后缀额外顺序（会与 adjust_type 生成的序列 merge 去重）
+set_option('data_source_preference', ['_daily','_daily_qfq','_日'])
+
+# 强制覆盖：优先级最高（存在则直接使用）
+set_option('force_data_variant', 'qfq')  # 'raw'|'daily'|'qfq'|'hfq'|'日'
+```
+
+### 2. 语义规则
+
+| adjust_type | use_real_price=True 时候选顺序 | use_real_price=False 时候选顺序 | 说明                                    |
+| ----------- | ------------------------------ | ------------------------------- | --------------------------------------- |
+| raw         | raw > qfq > hfq                | raw > qfq > hfq                 | 始终尽量未复权价撮合                    |
+| qfq         | qfq > raw > hfq                | qfq > raw > hfq                 | 强制前复权优先                          |
+| hfq         | hfq > raw > qfq                | hfq > raw > qfq                 | 强制后复权优先                          |
+| auto (默认) | raw > qfq > hfq                | qfq > raw > hfq                 | 与聚宽约定：真实价 → raw；否则 → 前复权 |
+
+内部会根据英文与中文两套命名族自动扩展：`_daily` 与 `_日` 同层级、`_daily_qfq` 与 `_日_qfq` 同层级，以提升命中率。
+
+最终序列 = (adjust_type 推导序列) + (data_source_preference) 去重保序。
+
+### 3. 强制指定
+
+`force_data_variant` 若设置并且目标文件存在，会直接选中（并记录 `[data_source_force]` 日志），忽略其余顺序。不存在则回退正常流程。
+
+### 4. 审计日志
+
+运行时日志示例（节选）：
+
+```
+[data_source_scan] adjust_type=auto base=000516 candidates=000516_daily:Y|000516_日:N|000516_daily_qfq:Y|... selected=000516_daily merged_suffixes=_daily|_日|_daily_qfq|_日_qfq|_daily_hfq|_日_hfq
+```
+
+含义：
+
+- base=000516 原始证券代码主干
+- candidates 每个候选文件是否存在 (Y/N)
+- selected 实际选中（首个存在的）
+- merged_suffixes 合成后的后缀优先列表（用于排查顺序逻辑）
+- adjust_type 当前解析到的复权模式
+
+`metrics` 中会新增：
+
+```
+"adjust_type": "auto",
+"data_sources_used": {"000516.XSHE": "000516_daily"}
+```
+
+### 5. 下单与交易路径影响
+
+第二笔及后续交易数量差异经常来自：
+
+1. 复权价 vs 未复权价 导致单位股数成本不同，进而影响剩余现金。
+2. 最小佣金（5 元）放大小额成交的费用相对比例。
+3. order_value sizing 在逼近可用现金的迭代中，价格/费用口径变化。
+
+通过设置：
+
+```python
+set_option('use_real_price', True)
+set_option('adjust_type', 'auto')  # 或显式 'raw'
+```
+
+即可确保使用未复权真实价；若想复刻“前复权价下单”场景则：
+
+```python
+set_option('use_real_price', False)
+set_option('adjust_type', 'qfq')   # 或 auto (默认) 也会落在前复权
+```
+
+### 6. 典型排障步骤
+
+1. 打开日志中 `[data_source_scan]` 行确认是否选对文件。
+2. metrics['data_sources_used'] 确认最终文件名是否含 `_daily` / `_daily_qfq` 与预期一致。
+3. 对比第一笔与第二笔 `[order_value_calc]` 里的 price / comm / leftover 识别差异来源。
+4. 切换 adjust_type = 'raw' 与 'qfq' 回放，验证股数与剩余现金差异是否收敛到预期。
+
+### 7. 后续规划
+
+- 引入前/后复权因子表，支持持仓数量 / 成本在除权除息日的自动调整（当前版本未处理派息送股）。
+- 在 "auto" 模式下加入“若某日 raw 缺失而 qfq 存在” 的跨日动态回退（目前是初始化一次性选取）。
+
+若需要扩展更多市场或分钟级数据，可在 `backtest_engine.py` 中扩展 `_resolve_adjust_pref`。欢迎继续反馈实际对齐聚宽时的差异场景。
