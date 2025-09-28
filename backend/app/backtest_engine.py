@@ -103,6 +103,8 @@ class BacktestResult:
     metrics: Dict[str, Any]
     equity_curve: List[Dict[str, Any]]  # 策略累计净值
     daily_returns: List[Dict[str, Any]]  # 策略日收益
+    daily_pnl: List[Dict[str, Any]]  # 新增：每日盈亏（金额）
+    daily_turnover: List[Dict[str, Any]]  # 新增：每日买卖额/开平仓计数
     benchmark_curve: List[Dict[str, Any]]  # 基准累计净值
     excess_curve: List[Dict[str, Any]]  # 超额累计净值 (策略/基准 -1)
     trades: List[TradeRecord]
@@ -900,6 +902,20 @@ def run_backtest(
 
         daily_returns = [{'date': dt.strftime('%Y-%m-%d'), 'ret': r} for dt, r in timereturn.items() if dt.strftime('%Y-%m-%d') >= start]
 
+        # 依据日收益计算每日盈亏（金额），从初始资金开始滚动
+        daily_pnl: List[Dict[str, Any]] = []
+        try:
+            prev_equity_val = float(cash)
+            # 使用与 daily_returns 相同的日期顺序
+            for dr in daily_returns:
+                r = float(dr['ret'])
+                pnl_amt = prev_equity_val * r
+                eq_after = prev_equity_val + pnl_amt
+                daily_pnl.append({'date': dr['date'], 'pnl': pnl_amt, 'equity': eq_after})
+                prev_equity_val = eq_after
+        except Exception:
+            daily_pnl = []
+
         # 交易聚合数据
         total_trades = trade_ana.get('total', {}).get('total', 0)
         won = trade_ana.get('won', {}).get('total', 0)
@@ -1033,17 +1049,25 @@ def run_backtest(
         if 'benchmark_detect_phase' not in metrics:
             metrics['benchmark_detect_phase'] = 'none'
 
-        # 重新计算并覆盖夏普；计算 α/β（CAPM，默认 Rf=0，可通过 set_option('risk_free_rate') 年化设定）
+        # 重新计算并覆盖夏普；计算 α/β（CAPM，默认 Rf=3% 年化，可通过 set_option('risk_free_rate') 年化设定）
         try:
             import math as _math
-            # 交易日年化因子（聚宽口径常用 250）
+            # 交易日年化因子（聚宽口径常用 250，可通过 set_option('annualization_factor' 或 'trading_days') 配置）
             trading_days = 250.0
-            # 年化无风险利率（例如 0.02 表示 2% 年化）
-            rf_annual = 0.0
             try:
-                rf_opt = jq_state.get('options', {}).get('risk_free_rate', 0.0)
-                if isinstance(rf_opt, (int, float)):
-                    rf_annual = float(rf_opt)
+                td_opt = jq_state.get('options', {}).get('annualization_factor') or jq_state.get('options', {}).get('trading_days')
+                if isinstance(td_opt, (int, float)) and td_opt > 0:
+                    trading_days = float(td_opt)
+            except Exception:
+                pass
+            # 年化无风险利率（例如 0.04 表示 4% 年化，若未配置默认采用 4% 贴近聚宽习惯）
+            rf_annual = 0.04
+            try:
+                _opts = jq_state.get('options', {})
+                if isinstance(_opts, dict) and ('risk_free_rate' in _opts):
+                    rf_opt = _opts.get('risk_free_rate')
+                    if isinstance(rf_opt, (int, float)):
+                        rf_annual = float(rf_opt)
             except Exception:
                 pass
             rf_daily = (1.0 + rf_annual) ** (1.0 / trading_days) - 1.0
@@ -1099,7 +1123,7 @@ def run_backtest(
                 if vol_annual > 0:
                     sharpe_jq = (r_annual_cagr - rf_annual) / vol_annual
 
-            # 选择输出口径：默认使用 mean-excess（日度均值法）更贴近聚宽；可通过 set_option('sharpe_method','mean'|'cagr') 切换
+            # 选择输出口径：默认使用 CAGR 年化口径（与聚宽文档展示式一致）；可通过 set_option('sharpe_method','mean'|'cagr') 切换
             sharpe_method = None
             try:
                 sm = jq_state.get('options', {}).get('sharpe_method')
@@ -1108,11 +1132,12 @@ def run_backtest(
             except Exception:
                 sharpe_method = None
             if not sharpe_method:
-                sharpe_method = 'mean'
+                sharpe_method = 'cagr'
             if sharpe_method == 'cagr':
                 metrics['sharpe'] = sharpe_jq if (sharpe_jq is not None) else sharpe_mean_excess
             else:
                 metrics['sharpe'] = sharpe_mean_excess if (sharpe_mean_excess is not None) else sharpe_jq
+            metrics['sharpe_method'] = sharpe_method
             try:
                 jq_state['log'].append(
                     f"[sharpe] method={sharpe_method or 'mean'} jq={sharpe_jq} mean_excess={sharpe_mean_excess} n={len(sr_seq)} ddof=1 exclude_first={sharpe_exclude_first}"
@@ -1133,7 +1158,9 @@ def run_backtest(
             except Exception:
                 pass
 
-            # 计算 α / β（Jensen α）：采用“原始日收益回归 + Rf 校正”，更贴近聚宽
+            # 计算 α / β
+            # β：仍采用“日度收益回归”的样本协方差法
+            # α：按聚宽展示公式（使用年化收益） Alpha = Rp - [ Rf + β (Rm - Rf) ]
             if aligned_sr and aligned_br and len(aligned_sr) == len(aligned_br):
                 # α/β 使用“全部对齐样本”；Sharpe 根据上面选项决定是否排除首样本
                 Rs = list(map(float, aligned_sr))
@@ -1150,13 +1177,24 @@ def run_backtest(
                     return sum((x[i]-mx)*(y[i]-my) for i in range(n)) / (n - 1)
                 var_b = _cov(Rb, Rb)
                 beta = (_cov(Rb, Rs) / var_b) if var_b > 0 else None
-                # 回归截距（原始收益）：intercept_raw = mean(Rs) - beta*mean(Rb)
-                intercept_raw = (ms - (beta * mb)) if (beta is not None) else None
-                # Jensen α（日度）：对截距进行 Rf 校正
-                # CAPM: Rs - Rf = α + β(Rb - Rf) => α = intercept_raw - (1-β) * Rf
-                alpha_daily = (intercept_raw - (1.0 - beta) * rf_daily) if (intercept_raw is not None and beta is not None) else None
-                # 年化 α（线性 × 250）
-                alpha_annual = (alpha_daily * trading_days) if (alpha_daily is not None) else None
+                # 年化收益（使用对齐样本）
+                n_align = float(len(Rs))
+                # 策略年化收益（CAGR）
+                cum_s = 1.0
+                for r in Rs:
+                    cum_s *= (1.0 + r)
+                rp_annual = (cum_s ** (trading_days / n_align) - 1.0) if n_align > 0 else None
+                # 基准年化收益（CAGR）
+                cum_b = 1.0
+                for r in Rb:
+                    cum_b *= (1.0 + r)
+                rm_annual = (cum_b ** (trading_days / n_align) - 1.0) if n_align > 0 else None
+                # Alpha（年化）: Rp - [ Rf + β (Rm - Rf) ]
+                alpha_annual = None
+                if (beta is not None) and (rp_annual is not None) and (rm_annual is not None):
+                    alpha_annual = rp_annual - (rf_annual + beta * (rm_annual - rf_annual))
+                # 额外提供日度口径（简单线性换算）
+                alpha_daily = (alpha_annual / trading_days) if (alpha_annual is not None and trading_days > 0) else None
                 metrics['beta'] = beta
                 metrics['alpha_daily'] = alpha_daily
                 metrics['alpha_annual'] = alpha_annual
@@ -1171,15 +1209,19 @@ def run_backtest(
                 metrics['alpha'] = alpha_annual if alpha_unit == 'annual' else alpha_daily
                 try:
                     jq_state['log'].append(
-                        f"[alpha] model=raw+jensen unit={alpha_unit} daily={alpha_daily} annual={alpha_annual} beta={beta} rf_annual={rf_annual} n_align={len(aligned_sr)}"
+                        f"[alpha] model=annual_formula unit={alpha_unit} rp_annual={rp_annual} rm_annual={rm_annual} daily={alpha_daily} annual={alpha_annual} beta={beta} rf_annual={rf_annual} n_align={len(aligned_sr)}"
                     )
                 except Exception:
                     pass
+                metrics['alpha_unit'] = alpha_unit
             else:
                 metrics['beta'] = None
                 metrics['alpha'] = None
                 metrics['alpha_daily'] = None
                 metrics['alpha_annual'] = None
+            # 补充导出审计字段，便于与聚宽核对
+            metrics['annualization_factor'] = int(trading_days)
+            metrics['sharpe_rf_annual'] = rf_annual
         except Exception:
             # 若计算失败，不影响回测其他结果
             if 'beta' not in metrics:
@@ -1220,6 +1262,40 @@ def run_backtest(
         trades: List[TradeRecord] = strat.analyzers.trade_capture.get_analysis() if hasattr(strat.analyzers, 'trade_capture') else []
         orders: List[OrderRecord] = strat.analyzers.order_capture.get_analysis() if hasattr(strat.analyzers, 'order_capture') else []
 
+        # 汇总每日买卖柱（金额口径），并统计当日开仓/平仓次数（基于 TradeCapture 的 open/close 日期）
+        daily_turnover_map: Dict[str, Dict[str, Any]] = {}
+        try:
+            for od in (orders or []):
+                d = od.datetime or ''
+                if not d:
+                    continue
+                rec = daily_turnover_map.setdefault(d, {'date': d, 'buy_amt': 0.0, 'sell_amt': 0.0, 'buy_cnt': 0, 'sell_cnt': 0, 'open_cnt': 0, 'close_cnt': 0})
+                val = float(od.value) if od.value is not None else 0.0
+                if (od.side or '').upper() == 'BUY':
+                    rec['buy_amt'] += abs(val)
+                    rec['buy_cnt'] += 1
+                elif (od.side or '').upper() == 'SELL':
+                    rec['sell_amt'] += abs(val)
+                    rec['sell_cnt'] += 1
+            for tr in (trades or []):
+                if tr.open_datetime:
+                    rec = daily_turnover_map.setdefault(tr.open_datetime, {'date': tr.open_datetime, 'buy_amt': 0.0, 'sell_amt': 0.0, 'buy_cnt': 0, 'sell_cnt': 0, 'open_cnt': 0, 'close_cnt': 0})
+                    rec['open_cnt'] += 1
+                if tr.close_datetime:
+                    rec = daily_turnover_map.setdefault(tr.close_datetime, {'date': tr.close_datetime, 'buy_amt': 0.0, 'sell_amt': 0.0, 'buy_cnt': 0, 'sell_cnt': 0, 'open_cnt': 0, 'close_cnt': 0})
+                    rec['close_cnt'] += 1
+        except Exception:
+            pass
+        # 仅保留回测窗口内的日期，并按日期排序
+        daily_turnover: List[Dict[str, Any]] = []
+        try:
+            sdt = pd.to_datetime(start)
+            edt = pd.to_datetime(end)
+            daily_turnover = [v for k, v in daily_turnover_map.items() if sdt <= pd.to_datetime(k) <= edt]
+            daily_turnover.sort(key=lambda x: x['date'])
+        except Exception:
+            daily_turnover = list(sorted(daily_turnover_map.values(), key=lambda x: x['date']))
+
         # 聚宽兼容记录日期对齐: 若用户 record 次数与 equity_curve 后段长度匹配, 补齐日期
         jq_records = jq_state.get('records') if 'jq_state' in locals() else None
         if jq_records and equity_curve:
@@ -1238,6 +1314,8 @@ def run_backtest(
             metrics=metrics,
             equity_curve=equity_curve,
             daily_returns=daily_returns,
+            daily_pnl=daily_pnl,
+            daily_turnover=daily_turnover,
             benchmark_curve=benchmark_curve,
             excess_curve=excess_curve,
             trades=trades,
@@ -1252,6 +1330,8 @@ def run_backtest(
             metrics={'error': True},
             equity_curve=[],
             daily_returns=[],
+            daily_pnl=[],
+            daily_turnover=[],
             benchmark_curve=[],
             excess_curve=[],
             trades=[],

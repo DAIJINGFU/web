@@ -110,7 +110,39 @@ uvicorn backend.app.main:app --reload
 页面左边填写:
 
 - symbol: 如 `000516_daily` (对应文件 `data/000516_daily.csv`)
-- benchmark*symbol (可选) : 基准, 如 `000300*日`
+# Web Backtest Demo
+
+## 对齐聚宽指标口径（Sharpe/Alpha）
+
+为使本地回测的夏普比率与阿尔法尽量贴近聚宽（JoinQuant）的展示口径，后端已做如下处理：
+
+- 阿尔法/贝塔：采用日度收益对齐基准后做线性回归，再按 Jensen α 进行 Rf 校正；阿尔法默认按年化（× 年化因子）输出。
+ 无风险利率：默认 4% 年化（0.04），可通过 set_option('risk_free_rate', 0.04) 调整。
+ 夏普计算：默认使用“CAGR 年化口径”（Rp年化与波动年化的标准 Sharpe 形式），也支持“日度超额收益均值法”。
+ 可通过 set_option('sharpe_method', 'cagr'|'mean') 切换（默认 cagr）。
+
+在策略代码（无论 backtrader 或聚宽风格）中，可以直接调用这些选项：
+
+```python
+# 设置聚宽兼容参数（在策略类定义前或 initialize 内）
+set_benchmark('000300.XSHG')
+set_option('risk_free_rate', 0.03)           # 年化无风险利率 3%
+set_option('annualization_factor', 250)      # 年化交易日数 250
+set_option('sharpe_method', 'mean')          # 夏普计算口径：mean/cagr
+set_option('alpha_unit', 'annual')           # 阿尔法输出单位：annual/daily
+```
+
+后端在响应 JSON 的 `metrics` 字段中也会返回审计信息：
+
+- `annualization_factor`, `sharpe_rf_annual`, `sharpe_method`, `alpha_unit` 等，便于和聚宽口径对比核对。
+
+如仍与聚宽有差异，常见原因包括：
+
+- 基准指数不同（或数据源起始点不同）。
+- 成交价口径不同（`fill_price` 可选 `open` 或 `close`，默认 `open`）。
+- 滑点/佣金设置不同。
+- 收益序列是否包含首个样本、是否对齐缺失日期等细节。
+
 - 开始 / 结束日期
 - 初始资金
 - 策略代码 (必须包含 `class UserStrategy(bt.Strategy)`)

@@ -1,0 +1,29 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run smoke test",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"scripts/smoke_test.py"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run smoke test",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"scripts/smoke_test.py"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		}
+	]
+}

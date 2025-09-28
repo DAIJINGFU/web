@@ -184,7 +184,7 @@
       #chartsGrid {
         display: grid;
         grid-template-columns: 1.4fr 1fr;
-        grid-template-rows: 340px 240px 240px;
+        grid-template-rows: 340px 240px 240px 240px 240px;
         gap: 14px;
       }
       .chart {
@@ -292,7 +292,7 @@
       @media (max-width: 1380px) {
         #chartsGrid {
           grid-template-columns: 1fr;
-          grid-template-rows: 320px 240px 240px 240px 240px;
+          grid-template-rows: 320px 240px 240px 240px 240px 240px 240px;
         }
       }
       @media (max-width: 980px) {
@@ -373,6 +373,8 @@ class UserStrategy(bt.Strategy):
             <div id="dailyReturnChart" class="chart"></div>
             <div id="benchmarkChart" class="chart"></div>
             <div id="excessChart" class="chart"></div>
+            <div id="dailyPnlChart" class="chart"></div>
+            <div id="turnoverChart" class="chart"></div>
           </div>
         </div>
         <div class="panel split-2">
@@ -712,7 +714,14 @@ class UserStrategy(bt.Strategy):
         return series; // dd <= 0
       }
 
-      function drawCharts(equity, returns, benchmark, excess) {
+      function drawCharts(
+        equity,
+        returns,
+        benchmark,
+        excess,
+        dailyPnl,
+        dailyTurnover
+      ) {
         const theme = {
           textStyle: { color: "#b9c4cc" },
           tooltip: { trigger: "axis" },
@@ -855,10 +864,90 @@ class UserStrategy(bt.Strategy):
             },
           ],
         });
+        // Daily P&L (金额)
+        const dpDiv = document.getElementById("dailyPnlChart");
+        if (dpDiv)
+          dpDiv.title = "每日盈亏：以金额展示 = 前一日权益 × 当日收益率";
+        const dpChart = echarts.init(dpDiv);
+        dpChart.setOption({
+          ...theme,
+          title: { text: "每日盈亏(¥)", left: 10 },
+          xAxis: {
+            type: "category",
+            data: (dailyPnl || []).map((x) => x.date),
+          },
+          yAxis: { type: "value" },
+          series: [
+            {
+              type: "bar",
+              data: (dailyPnl || []).map((x) => x.pnl || 0),
+              itemStyle: {
+                color: (p) => (p.value >= 0 ? "#29c66f" : "#d64545"),
+              },
+            },
+          ],
+          tooltip: {
+            trigger: "axis",
+            formatter: (items) => {
+              const it = items && items[0];
+              if (!it) return "";
+              const row = (dailyPnl || [])[it.dataIndex] || {};
+              const pnl = Number(row.pnl || 0).toFixed(2);
+              const eq = Number(row.equity || 0).toFixed(2);
+              return `${row.date}<br/>当日盈亏: ${pnl}<br/>当日收盘权益: ${eq}`;
+            },
+          },
+        });
+        // Daily Turnover (买卖额)
+        const toDiv = document.getElementById("turnoverChart");
+        if (toDiv)
+          toDiv.title =
+            "每日买卖额：按成交金额汇总，绿色=买入额，红色=卖出额；提示里含开/平仓次数";
+        const toChart = echarts.init(toDiv);
+        const toDates = (dailyTurnover || []).map((x) => x.date);
+        toChart.setOption({
+          ...theme,
+          title: { text: "每日买卖额(¥)", left: 10 },
+          xAxis: { type: "category", data: toDates },
+          yAxis: { type: "value" },
+          legend: { data: ["买入", "卖出"] },
+          series: [
+            {
+              name: "买入",
+              type: "bar",
+              stack: "turnover",
+              data: (dailyTurnover || []).map((x) => x.buy_amt || 0),
+              itemStyle: { color: "#29c66f" },
+            },
+            {
+              name: "卖出",
+              type: "bar",
+              stack: "turnover",
+              data: (dailyTurnover || []).map((x) => -(x.sell_amt || 0)),
+              itemStyle: { color: "#d64545" },
+            },
+          ],
+          tooltip: {
+            trigger: "axis",
+            formatter: (items) => {
+              const idx = items && items[0] ? items[0].dataIndex : 0;
+              const row = (dailyTurnover || [])[idx] || {};
+              const b = Number(row.buy_amt || 0).toFixed(2);
+              const s = Number(row.sell_amt || 0).toFixed(2);
+              return `${
+                row.date
+              }<br/>买入额: ${b}<br/>卖出额: ${s}<br/>开仓数: ${
+                row.open_cnt || 0
+              } 平仓数: ${row.close_cnt || 0}`;
+            },
+          },
+        });
         window.addEventListener("resize", () => {
           eqChart.resize();
           ddChart.resize();
           drChart.resize();
+          dpChart.resize();
+          toChart.resize();
           bmChart.resize();
           exChart.resize();
         });
@@ -968,7 +1057,9 @@ class UserStrategy(bt.Strategy):
           data.equity_curve || [],
           data.daily_returns || [],
           data.benchmark_curve || [],
-          data.excess_curve || []
+          data.excess_curve || [],
+          data.daily_pnl || [],
+          data.daily_turnover || []
         );
         renderTrades(data.trades || []);
         renderOrders(data.orders || []);
