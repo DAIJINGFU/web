@@ -625,17 +625,26 @@ def compile_user_strategy(code: str):
                         if base_price <= 0:
                             return
                         slip_perc = float(jqst['options'].get('slippage_perc', 0.0) or 0.0)
-                        # 方案2 半滑点：内部执行价 = base_price*(1±slip/2) 后买向下截断 / 卖向上进位到分
+                        # 半滑点：计算潜在“执行”价格（仅用于估算真实成交，不再影响 sizing）
                         half = slip_perc / 2.0
-                        # use module-level _math
-                        def _round_buy(p: float) -> float:
+                        def _round_buy(p: float) -> float:  # use module-level _math
                             return _math.floor(p * 100) / 100.0
-                        def _round_sell(p: float) -> float:
+                        def _round_sell(p: float):
                             return _math.ceil(p * 100) / 100.0
                         price = base_price
                         debug_trading = bool(jqst['options'].get('debug_trading', False))
-                        buy_eff_price = _round_buy(base_price * (1 + half))
-                        sell_eff_price = _round_sell(base_price * (1 - half))
+                        exec_buy_price = _round_buy(base_price * (1 + half)) if slip_perc else base_price
+                        exec_sell_price = _round_sell(base_price * (1 - half)) if slip_perc else base_price
+                        # 是否在 sizing 中忽略滑点（默认 True，更贴近聚宽：shares = floor(cash/open)）
+                        sizing_use_raw = True
+                        try:
+                            opt_sz_raw = jqst['options'].get('sizing_use_raw_open_price')
+                            if isinstance(opt_sz_raw, bool):
+                                sizing_use_raw = opt_sz_raw
+                        except Exception:
+                            sizing_use_raw = True
+                        if debug_trading:
+                            jqst['log'].append(f"[sizing_slip_mode] sizing_use_raw_open_price={sizing_use_raw} slip_perc={slip_perc}")
                         # 涨跌停判定（简单：比较上一交易日收盘）
                         if enable_limit:
                             try:
@@ -647,7 +656,7 @@ def compile_user_strategy(code: str):
                                 up_lim = _round_to_tick(prev_close * up_lim_fac, tick)
                                 down_lim = _round_to_tick(prev_close * down_lim_fac, tick)
                                 side_tmp = 'BUY' if value >= 0 else 'SELL'
-                                eff_price = buy_eff_price if side_tmp == 'BUY' else sell_eff_price
+                                eff_price = exec_buy_price if side_tmp == 'BUY' else exec_sell_price
                                 if side_tmp == 'BUY' and eff_price >= up_lim - 1e-9:
                                     exec_env['log'].info(
                                         f"[limit_check] BLOCK side=BUY price={eff_price:.4f} up_lim={up_lim:.4f} prev_close={prev_close:.4f}"
@@ -688,16 +697,18 @@ def compile_user_strategy(code: str):
                         # 买入金额
                         if value > 0:
                             # 先用买入有效价估算股数
-                            est_price = buy_eff_price
+                            # sizing 基准价：raw base 或（旧方案）含滑点执行价
+                            sizing_price = base_price if sizing_use_raw else exec_buy_price
+                            est_price = sizing_price
                             # 可选“保守模式”：若上一日收盘(prev_close)高于买入有效价，用 prev_close 作为 sizing 基准，避免实际撮合价>估价导致保证金 0。
                             # 聚宽本身按 (cash // buy_price) 取整再对齐 lot；这里通过开关控制：True=当前默认保守, False=严格 JQ 样式。
-                            conservative_flag = True
+                            conservative_flag = False  # 默认关闭：与聚宽一致，按开盘价(或 sizing_price) 直接 sizing
                             try:
                                 opt_cons = jqst['options'].get('order_value_conservative_prev_close')
                                 if isinstance(opt_cons, bool):
                                     conservative_flag = opt_cons
                             except Exception:
-                                conservative_flag = True
+                                conservative_flag = False
                             conservative_price = est_price
                             prev_close_for_size = None
                             try:
@@ -706,7 +717,7 @@ def compile_user_strategy(code: str):
                                 prev_close_for_size = None
                             if conservative_flag and prev_close_for_size and prev_close_for_size > conservative_price:
                                 conservative_price = prev_close_for_size
-                            raw_shares = int(value // (conservative_price if conservative_flag else est_price))
+                            raw_shares = int(value // (conservative_price if conservative_flag else sizing_price))
                             # 按 lot 对齐
                             shares = (raw_shares // lot) * lot
                             if shares <= 0:
@@ -714,38 +725,47 @@ def compile_user_strategy(code: str):
                                     exec_env['log'].info(f"[sizing] BUY abort raw_shares={raw_shares} lot={lot} est={est_price} conservative={conservative_price} cash={available_cash}")
                                 return
                             # 费用估算（迭代一次足够）
-                            gross_price_for_fee = conservative_price if conservative_flag else est_price
+                            # 费用与现金占用使用“执行价格” (含滑点)，以避免超买；若无滑点则等于 base
+                            exec_price_for_cost = exec_buy_price
+                            gross_price_for_fee = exec_price_for_cost if (conservative_flag or sizing_use_raw) else exec_buy_price
                             gross = shares * gross_price_for_fee
                             comm = max(gross * commission_rate, min_comm)
                             total_cost = gross + comm  # 不含印花税（买入无印花税）
                             if total_cost > available_cash:
-                                # 缩减 shares
-                                max_afford = int((available_cash - min_comm) // gross_price_for_fee)
-                                shares = (max_afford // lot) * lot
+                                # 迭代减 lot 直到满足现金（保留简单循环，lot 数量通常极少）
+                                while shares > 0:
+                                    max_cost = shares * gross_price_for_fee + max(shares * gross_price_for_fee * commission_rate, min_comm)
+                                    if max_cost <= available_cash:
+                                        break
+                                    shares -= lot
+                                if shares < 0:
+                                    shares = 0
                             if shares <= 0:
                                 if debug_trading:
-                                    exec_env['log'].info(f"[sizing] BUY zero_after_cash max_afford={max_afford} cons_price={gross_price_for_fee} cash={available_cash}")
+                                    exec_env['log'].info(f"[sizing] BUY zero_after_cash cons_price={gross_price_for_fee} cash={available_cash}")
                                 return
                             if debug_trading:
                                 exec_env['log'].info(
-                                    f"[sizing] BUY shares={shares} est={est_price} prev_close={prev_close_for_size} cons_flag={conservative_flag} cons_price={conservative_price} gross_price_used={gross_price_for_fee} gross={gross:.2f} comm_est={comm:.2f} total={total_cost:.2f} cash={available_cash:.2f}"
+                                    f"[sizing] BUY shares={shares} sizing_price={sizing_price} exec_price={exec_buy_price} prev_close={prev_close_for_size} cons_flag={conservative_flag} cons_price={conservative_price} gross_price_used={gross_price_for_fee} gross={gross:.2f} comm_est={comm:.2f} total={total_cost:.2f} cash={available_cash:.2f}"
                                 )
                             else:
                                 # 非 debug 也记录一次模式
                                 try:
-                                    jqst['log'].append(f"[sizing_mode] conservative_prev_close={conservative_flag}")
+                                    jqst['log'].append(
+                                        f"[sizing_mode] conservative_prev_close={conservative_flag} sizing_use_raw={sizing_use_raw} raw_shares={raw_shares} final_shares={shares} base_price={base_price} prev_close={prev_close_for_size} exec_price={exec_buy_price}"
+                                    )
                                 except Exception:
                                     pass
                             self.buy(size=shares)
                         elif value < 0:
                             # 卖出金额：目标卖出 value_abs ，不超过持仓
-                            est_price = sell_eff_price
+                            est_price = exec_sell_price if not sizing_use_raw else base_price
                             value_abs = abs(value)
                             max_sell_shares = position_size if position_size > 0 else 0
                             if max_sell_shares <= 0:
                                 return
                             # 需要的股数
-                            raw_need = int(value_abs // est_price)
+                            raw_need = int(value_abs // (base_price if sizing_use_raw else exec_sell_price))
                             shares = min(max_sell_shares, (raw_need // lot) * lot if raw_need > 0 else 0)
                             if shares <= 0:
                                 # 若希望彻底清仓且金额较小，允许直接全部平掉（与 value 小但有持仓的情况）
@@ -757,7 +777,7 @@ def compile_user_strategy(code: str):
                                     exec_env['log'].info(f"[sizing] SELL abort raw_need={raw_need} lot={lot} pos={position_size} est={est_price}")
                                 return
                             if debug_trading:
-                                exec_env['log'].info(f"[sizing] SELL shares={shares} est={est_price} pos={position_size}")
+                                exec_env['log'].info(f"[sizing] SELL shares={shares} sizing_price={(base_price if sizing_use_raw else exec_sell_price)} exec_price={exec_sell_price} pos={position_size}")
                             self.sell(size=shares)
                     except Exception as _e:
                         try:
@@ -794,8 +814,8 @@ def compile_user_strategy(code: str):
                             return _math.floor(p * 100) / 100.0
                         def _round_sell(p: float) -> float:
                             return _math.ceil(p * 100) / 100.0
-                        buy_eff_price = _round_buy(base_price * (1 + half))
-                        sell_eff_price = _round_sell(base_price * (1 - half))
+                        exec_buy_price = _round_buy(base_price * (1 + half)) if slip_perc else base_price
+                        exec_sell_price = _round_sell(base_price * (1 - half)) if slip_perc else base_price
                         price = base_price
                         # limit check
                         prev_close = None
@@ -818,31 +838,31 @@ def compile_user_strategy(code: str):
                         if delta == 0:
                             return
                         if enable_limit and prev_close and prev_close > 0:
-                            if delta > 0 and up_lim is not None and buy_eff_price >= up_lim - 1e-9:
+                            if delta > 0 and up_lim is not None and exec_buy_price >= up_lim - 1e-9:
                                 exec_env['log'].info(
-                                    f"[limit_check] BLOCK side=BUY price={buy_eff_price:.4f} up_lim={up_lim:.4f} prev_close={prev_close:.4f}"
+                                    f"[limit_check] BLOCK side=BUY price={exec_buy_price:.4f} up_lim={up_lim:.4f} prev_close={prev_close:.4f}"
                                 )
                                 jqst['blocked_orders'].append(OrderRecord(
                                     datetime=jqst.get('current_dt','').split(' ')[0],
                                     symbol=jqst.get('primary_symbol') or str(security).split('.')[0],
                                     side='BUY',
                                     size=0,
-                                    price=buy_eff_price,
+                                    price=exec_buy_price,
                                     value=0.0,
                                     commission=0.0,
                                     status='BlockedLimitUp'
                                 ))
                                 return
-                            if delta < 0 and down_lim is not None and sell_eff_price <= down_lim + 1e-9:
+                            if delta < 0 and down_lim is not None and exec_sell_price <= down_lim + 1e-9:
                                 exec_env['log'].info(
-                                    f"[limit_check] BLOCK side=SELL price={sell_eff_price:.4f} down_lim={down_lim:.4f} prev_close={prev_close:.4f}"
+                                    f"[limit_check] BLOCK side=SELL price={exec_sell_price:.4f} down_lim={down_lim:.4f} prev_close={prev_close:.4f}"
                                 )
                                 jqst['blocked_orders'].append(OrderRecord(
                                     datetime=jqst.get('current_dt','').split(' ')[0],
                                     symbol=jqst.get('primary_symbol') or str(security).split('.')[0],
                                     side='SELL',
                                     size=0,
-                                    price=sell_eff_price,
+                                    price=exec_sell_price,
                                     value=0.0,
                                     commission=0.0,
                                     status='BlockedLimitDown'
