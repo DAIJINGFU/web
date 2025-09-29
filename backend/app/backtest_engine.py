@@ -218,6 +218,42 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
             return
         jq_state['records'].append({'dt': None, **kwargs})
 
+    # ---- 聚宽风格滑点支持 ----
+    # 语义：若用户未显式设置，则默认使用 PriceRelatedSlippage(0.00246) ≈ 0.246%
+    # set_slippage(FixedSlippage(0.02))        -> 固定绝对价差 0.02 （按简单: open/close +/-0.02）
+    # set_slippage(PriceRelatedSlippage(0.00246)) -> 百分比滑点，最终买入价 = 基准价*(1+perc/2) 卖出价 = 基准价*(1-perc/2) 的近似；
+    # 这里我们简化：买入使用 price*(1+perc) 卖出使用 price*(1-perc)，并在订单估算中采用原价，撮合时通过 broker slippage 设置。
+    # backtrader 自带 set_slippage_perc 为单方向百分比增量（默认对成交价格直接乘 (1 + perc)）；
+    # 我们约定：PriceRelatedSlippage(p) -> 传入 perc=p；FixedSlippage 暂用 options.fixed_slippage 记录（可后续自定义执行层）。
+
+    def set_slippage(obj=None, type=None, ref=None):  # noqa: A002 (聚宽接口命名保持)
+        try:
+            # 解析两种文本形式：FixedSlippage(x) / PriceRelatedSlippage(y)
+            if obj is None:
+                return
+            s = str(obj)
+            import re as _re
+            m_fixed = _re.search(r'FixedSlippage\s*\(\s*([0-9eE\.+-]+)\s*\)', s)
+            m_price = _re.search(r'PriceRelatedSlippage\s*\(\s*([0-9eE\.+-]+)\s*\)', s)
+            if m_price:
+                val = float(m_price.group(1))
+                jq_state['options']['slippage_perc'] = val
+                jq_state['log'].append(f"[set_slippage] PriceRelatedSlippage perc={val}")
+            elif m_fixed:
+                val = float(m_fixed.group(1))
+                jq_state['options']['fixed_slippage'] = val
+                jq_state['log'].append(f"[set_slippage] FixedSlippage value={val}")
+            else:
+                # 允许直接给数字（按百分比）
+                try:
+                    val = float(obj)
+                    jq_state['options']['slippage_perc'] = val
+                    jq_state['log'].append(f"[set_slippage] perc={val}")
+                except Exception:
+                    jq_state['log'].append(f"[set_slippage_warning] unrecognized={s}")
+        except Exception:
+            pass
+
     # attribute_history 简化: 直接从已加载的 pandas 数据缓存里取；此时还未有数据引用，运行期在包装策略里实现
     def attribute_history(security: str, n: int, unit: str, fields: List[str]):
         raise RuntimeError('attribute_history 仅在聚宽兼容包装策略中可用')
@@ -232,6 +268,7 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         'g': g,
         'set_benchmark': set_benchmark,
         'set_option': set_option,
+        'set_slippage': set_slippage,
         'record': record,
         'log': log_obj,
         'attribute_history': attribute_history,
@@ -420,6 +457,10 @@ def compile_user_strategy(code: str):
                         if exec_env['jq_state'].get('in_warmup'):
                             return
                         jqst = exec_env['jq_state']
+                        strict = bool(jqst['options'].get('jq_order_mode_strict', False))
+                        enable_limit = bool(jqst['options'].get('enable_limit_check', False))
+                        up_lim_fac = float(jqst['options'].get('limit_up_factor', 1.10))
+                        down_lim_fac = float(jqst['options'].get('limit_down_factor', 0.90))
                         fill_price = str(jqst['options'].get('fill_price', 'open')).lower()
                         if fill_price == 'close':
                             price = float(getattr(self.data, 'close')[0])
@@ -427,6 +468,22 @@ def compile_user_strategy(code: str):
                             price = float(getattr(self.data, 'open')[0]) if hasattr(self.data, 'open') else float(getattr(self.data, 'close')[0])
                         if price <= 0:
                             return
+                        # 涨跌停判定（简单：比较上一交易日收盘）
+                        if enable_limit:
+                            try:
+                                prev_close = float(getattr(self.data, 'close')[-1])  # -1 为上一日 (backtrader 最后一根历史)
+                            except Exception:
+                                prev_close = None
+                            if prev_close and prev_close > 0:
+                                up_lim = prev_close * up_lim_fac
+                                down_lim = prev_close * down_lim_fac
+                                side_tmp = 'BUY' if value >= 0 else 'SELL'
+                                if side_tmp == 'BUY' and price >= up_lim - 1e-9:
+                                    exec_env['log'].info(f"[limit_check] BLOCK side=BUY price={price:.4f} up_lim={up_lim:.4f}")
+                                    return
+                                if side_tmp == 'SELL' and price <= down_lim + 1e-9:
+                                    exec_env['log'].info(f"[limit_check] BLOCK side=SELL price={price:.4f} down_lim={down_lim:.4f}")
+                                    return
                         lot = int(jqst['options'].get('lot', 100)) or 100
                         fee_cfg = jqst.get('fee_config', {})
                         rate = float(fee_cfg.get('rate', 0.0))
@@ -465,6 +522,18 @@ def compile_user_strategy(code: str):
                                     guess -= lot
                                 return 0
                             shares = _max_shares(target_amt)
+                            # 严格模式：尝试向上逼近（在不超现金的情况下寻找更接近 target 的 shares）
+                            if strict and shares > 0:
+                                cur = shares
+                                while True:
+                                    nxt = cur + lot
+                                    comm_n = max(min_commission, nxt * price * rate)
+                                    gross_n = nxt * price + comm_n
+                                    if gross_n <= target_amt + 1e-9 and gross_n <= broker_cash + 1e-9:
+                                        cur = nxt
+                                        continue
+                                    break
+                                shares = cur
                             if shares <= 0:
                                 exec_env['log'].info(f"[order_value_calc] side=BUY insufficient target_amt={target_amt:.2f} cash={broker_cash:.2f}")
                                 return
@@ -472,7 +541,7 @@ def compile_user_strategy(code: str):
                             gross_final = shares * price + comm_final
                             leftover = broker_cash - gross_final
                             exec_env['log'].info(
-                                f"[order_value_calc] side=BUY price={price:.4f} target={abs(value):.2f} cash={broker_cash:.2f} shares={shares} gross={shares*price:.2f} comm={comm_final:.2f} leftover={leftover:.2f} lot={lot}"
+                                f"[order_value_calc] side=BUY strict={strict} price={price:.4f} target={abs(value):.2f} cash={broker_cash:.2f} shares={shares} gross={shares*price:.2f} comm={comm_final:.2f} leftover={leftover:.2f} lot={lot}"
                             )
                             if shares > 0:
                                 self.buy(size=shares)
@@ -506,7 +575,7 @@ def compile_user_strategy(code: str):
                                 shares += lot
                                 net, gross, comm, tax = net2, gross2, comm2, tax2
                         exec_env['log'].info(
-                            f"[order_value_calc] side=SELL price={price:.4f} target={abs(value):.2f} pos_val={pos_size*price:.2f} shares={shares} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} lot={lot}" )
+                            f"[order_value_calc] side=SELL strict={strict} price={price:.4f} target={abs(value):.2f} pos_val={pos_size*price:.2f} shares={shares} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} lot={lot}" )
                         if shares > 0:
                             self.sell(size=shares)
                     except Exception as _e:
@@ -524,24 +593,86 @@ def compile_user_strategy(code: str):
                     - delta > 0 执行买入 delta 股；delta < 0 执行卖出 |delta| 股
                     - target == 0 等价于平仓
                     """
-                    cur = int(getattr(self.position, 'size', 0) or 0)
-                    tgt_raw = int(target or 0)
-                    lot = int(exec_env['jq_state']['options'].get('lot', 100)) if 'jq_state' in exec_env else 100
-                    # 目标同样按100股对齐
-                    tgt = (abs(tgt_raw) // lot) * lot
-                    tgt = tgt if tgt_raw >= 0 else -tgt
-                    delta = tgt - cur
-                    if delta == 0:
-                        return
-                    if delta > 0:
-                        self.buy(size=delta)
-                    else:
-                        # delta < 0 -> 卖出 |delta|
-                        # 若目标为 0 则等价于平仓
-                        if tgt == 0 and self.position:
-                            self.close()
+                    try:
+                        jqst = exec_env['jq_state']
+                        strict = bool(jqst['options'].get('jq_order_mode_strict', False))
+                        enable_limit = bool(jqst['options'].get('enable_limit_check', False))
+                        up_lim_fac = float(jqst['options'].get('limit_up_factor', 1.10))
+                        down_lim_fac = float(jqst['options'].get('limit_down_factor', 0.90))
+                        fill_price = str(jqst['options'].get('fill_price', 'open')).lower()
+                        if fill_price == 'close':
+                            price = float(getattr(self.data, 'close')[0])
                         else:
-                            self.sell(size=abs(delta))
+                            price = float(getattr(self.data, 'open')[0]) if hasattr(self.data, 'open') else float(getattr(self.data, 'close')[0])
+                        if price <= 0:
+                            return
+                        # limit check
+                        if enable_limit:
+                            try:
+                                prev_close = float(getattr(self.data, 'close')[-1])
+                            except Exception:
+                                prev_close = None
+                            if prev_close and prev_close > 0:
+                                up_lim = prev_close * up_lim_fac
+                                down_lim = prev_close * down_lim_fac
+                        cur = int(getattr(self.position, 'size', 0) or 0)
+                        tgt_raw = int(target or 0)
+                        lot = int(jqst['options'].get('lot', 100)) or 100
+                        tgt = (abs(tgt_raw) // lot) * lot
+                        tgt = tgt if tgt_raw >= 0 else -tgt
+                        delta = tgt - cur
+                        if delta == 0:
+                            return
+                        fee_cfg = jqst.get('fee_config', {})
+                        rate = float(fee_cfg.get('rate', 0.0))
+                        min_commission = float(fee_cfg.get('min_commission', 0.0))
+                        stamp_duty_rate = float(fee_cfg.get('stamp_duty', 0.0))
+                        broker_cash = float(self.broker.getcash())
+                        # BUY 增持
+                        if delta > 0:
+                            # 估算最大可买 shares (复用 order_value BUY 逻辑思路)
+                            def _max_buy(sh):
+                                comm = max(min_commission, sh * price * rate)
+                                return sh * price + comm
+                            buy_sh = delta
+                            if strict:
+                                # 若现金不足则向下回退
+                                while buy_sh > 0 and _max_buy(buy_sh) > broker_cash + 1e-9:
+                                    buy_sh -= lot
+                            else:
+                                if _max_buy(buy_sh) > broker_cash + 1e-9:
+                                    # 简单回退一次
+                                    buy_sh = (int(broker_cash / price) // lot) * lot
+                            if buy_sh <= 0:
+                                exec_env['log'].info(f"[order_target_calc] side=BUY BLOCK delta={delta} cash={broker_cash:.2f}")
+                                return
+                            comm_f = max(min_commission, buy_sh * price * rate)
+                            exec_env['log'].info(f"[order_target_calc] side=BUY strict={strict} price={price:.4f} cur={cur} tgt={tgt} delta={delta} exec_shares={buy_sh} gross={buy_sh*price:.2f} comm={comm_f:.2f} cash={broker_cash:.2f}")
+                            self.buy(size=buy_sh)
+                            return
+                        # SELL 减持
+                        sell_sh = abs(delta)
+                        sell_sh = min(sell_sh, cur)
+                        sell_sh = (sell_sh // lot) * lot
+                        if sell_sh <= 0:
+                            return
+                        # 严格模式：平仓时可以直接 close() 以减少潜在费用重复；否则按 size 卖
+                        if tgt == 0 and self.position:
+                            exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} price={price:.4f} cur={cur} tgt=0 close_all size={cur}")
+                            self.close()
+                            return
+                        # 估算费用
+                        gross = sell_sh * price
+                        comm = max(min_commission, gross * rate)
+                        tax = gross * stamp_duty_rate
+                        net = gross - comm - tax
+                        exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} price={price:.4f} cur={cur} tgt={tgt} delta={delta} exec_shares={sell_sh} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f}")
+                        self.sell(size=sell_sh)
+                    except Exception as _e:
+                        try:
+                            exec_env['log'].info(f"[order_target_error] {type(_e).__name__}:{_e}")
+                        except Exception:
+                            pass
 
                 # 动态覆盖 exec 环境里的函数（只在第一次后就不再改变 jq_state）
                 jq_state_ref = exec_env['jq_state']
@@ -989,6 +1120,14 @@ def run_backtest(
         except Exception:
             pass
         slippage_perc = jq_state.get('options', {}).get('slippage_perc')
+        # 若用户既未调用 set_slippage 也未 set_option(slippage_perc)，默认 PriceRelatedSlippage(0.00246)
+        if slippage_perc is None and 'fixed_slippage' not in jq_state.get('options', {}):
+            try:
+                slippage_perc = 0.00246
+                jq_state['options']['slippage_perc'] = slippage_perc
+                jq_state['log'].append(f"[slippage_default] PriceRelatedSlippage perc={slippage_perc}")
+            except Exception:
+                slippage_perc = None
         if slippage_perc is not None:
             try:
                 cerebro.broker.set_slippage_perc(perc=slippage_perc)
@@ -1128,7 +1267,11 @@ def run_backtest(
                 # 推断多空方向（正为买，负为卖）
                 size = getattr(order.executed, 'size', 0.0)
                 price = getattr(order.executed, 'price', 0.0)
-                value = getattr(order.executed, 'value', 0.0)
+                # Backtrader 的 order.executed.value 可能是根据价差/方向等内部逻辑计算的净值，
+                # 为确保与聚宽风格一致，这里强制使用 size * price 作为成交金额（方向性金额）。
+                orig_value = getattr(order.executed, 'value', 0.0)
+                calc_value = size * price
+                value = calc_value
                 comm = getattr(order.executed, 'comm', 0.0)
                 side = 'BUY' if size >= 0 else 'SELL'
                 name = None
@@ -1144,14 +1287,15 @@ def run_backtest(
                     min_comm = float(fee_cfg.get('min_commission', 0.0))
                     stamp_duty = float(fee_cfg.get('stamp_duty', 0.0)) if side == 'SELL' else 0.0
                     if value is not None:
-                        raw_comm = abs(value) * rate
+                        gross = abs(value)
+                        raw_comm = gross * rate
                         # Backtrader 已经按照 rate 计算过 comm（近似 raw_comm），我们做调整：
                         # 1) 重新计算标准佣金 raw_comm
                         # 2) 应用最小佣金
                         adj_comm = raw_comm
                         if min_comm > 0 and adj_comm < min_comm:
                             adj_comm = min_comm
-                        total_fee = adj_comm + abs(value) * stamp_duty
+                        total_fee = adj_comm + gross * stamp_duty
                         # 更新 order.executed 的 comm（注意可能无写权限，捕获异常）
                         delta = total_fee - comm
                         if abs(delta) > 1e-9:
@@ -1165,6 +1309,14 @@ def run_backtest(
                             jq_state['log'].append(
                                 f"[fee] {side} {name} value={value:.2f} price={price:.4f} base_comm={raw_comm:.4f} adj_comm={adj_comm:.4f} stamp_duty={(abs(value)*stamp_duty):.4f} final_comm={comm:.4f}"
                             )
+                        except Exception:
+                            pass
+                        # 若原始 value 与重新计算差异较大，输出校正日志
+                        try:
+                            if orig_value is not None and abs(orig_value - value) > 1e-6:
+                                jq_state['log'].append(
+                                    f"[value_fix] {side} {name} orig_value={orig_value:.2f} recalculated={value:.2f} size={size} price={price:.4f}"
+                                )
                         except Exception:
                             pass
                 except Exception:
