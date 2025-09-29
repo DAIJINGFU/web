@@ -19,7 +19,8 @@ strategy_code = (
     "    set_option('annualization_factor', 250)\n"
     "    set_option('sharpe_method', 'mean')\n"
     "def handle_data(context, data):\n"
-    "    if context.portfolio.positions['600008.XSHG'].closeable_amount == 0:\n"
+    "    pos = context.portfolio.positions.get('600008.XSHG')\n"
+    "    if pos is None or getattr(pos, 'closeable_amount', 0) == 0:\n"
     "        order_value('600008.XSHG', 10000)\n"
 )
 

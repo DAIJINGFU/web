@@ -56,6 +56,7 @@
         margin: 4px 0 14px;
         font-weight: 600;
         background: var(--accent-grad);
+        background-clip: text;
         -webkit-background-clip: text;
         color: transparent;
       }
@@ -175,6 +176,45 @@
         padding: 14px 16px 10px;
         margin-bottom: 18px;
       }
+      .panel-column {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .panel-column h3 {
+        margin-bottom: 4px;
+      }
+      .table-scroll {
+        overflow: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: rgba(27, 38, 50, 0.6);
+        backdrop-filter: blur(3px);
+      }
+      .table-scroll::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      .table-scroll::-webkit-scrollbar-thumb {
+        background: rgba(94, 163, 255, 0.4);
+        border-radius: 999px;
+      }
+      .table-scroll--trades {
+        max-height: 320px;
+        min-height: 220px;
+      }
+      .table-scroll--orders {
+        height: 260px;
+        min-height: 220px;
+        max-height: 70vh;
+        resize: vertical;
+      }
+      .section-hint {
+        color: var(--muted);
+        font-size: 11px;
+        margin: -6px 0 4px;
+        line-height: 1.4;
+      }
       .panel h3 {
         margin: 0 0 10px;
         font-size: 14px;
@@ -225,8 +265,10 @@
         border-radius: 6px;
         padding: 8px 10px;
         line-height: 1.35;
-        max-height: 200px;
+        height: 160px;
+        max-height: 60vh;
         overflow: auto;
+        resize: vertical;
         white-space: pre-wrap;
         word-break: break-word;
       }
@@ -378,9 +420,12 @@ class UserStrategy(bt.Strategy):
           </div>
         </div>
         <div class="panel split-2">
-          <div>
+          <div class="panel-column">
             <h3>交易记录 <span class="badge" id="tradeCount"></span></h3>
-            <div style="max-height: 260px; overflow: auto">
+            <p class="section-hint">
+              成交级别的汇总（Trade），只记录已经撮合完成的买卖，方便回看真实成交成本。
+            </p>
+            <div class="table-scroll table-scroll--trades">
               <table id="tradesTable">
                 <thead>
                   <tr>
@@ -396,9 +441,15 @@ class UserStrategy(bt.Strategy):
               </table>
             </div>
           </div>
-          <div>
+          <div class="panel-column">
             <h3>订单明细 <span class="badge" id="orderCount"></span></h3>
-            <div style="max-height: 140px; overflow: auto">
+            <p class="section-hint">
+              委托级别的跟踪（Order），包含待成交、部分成交、成交完成或取消等状态，用于排查撮合与风控细节。
+            </p>
+            <div
+              class="table-scroll table-scroll--orders"
+              title="拖拽右下角可以调整高度"
+            >
               <table id="ordersTable">
                 <thead>
                   <tr>
@@ -415,10 +466,10 @@ class UserStrategy(bt.Strategy):
                 <tbody></tbody>
               </table>
             </div>
-            <h3 style="margin-top: 12px">日志 / 错误</h3>
-            <div id="log"></div>
-            <h3 style="margin-top: 18px">JQ Logs</h3>
-            <div id="jqLogs"></div>
+            <h3>日志 / 错误</h3>
+            <div id="log" title="拖拽右下角可放大"></div>
+            <h3>JQ Logs</h3>
+            <div id="jqLogs" title="拖拽右下角可放大"></div>
           </div>
         </div>
         <div class="panel">

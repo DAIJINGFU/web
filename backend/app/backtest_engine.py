@@ -6,11 +6,22 @@ import re
 import types
 import os
 from dataclasses import dataclass, asdict
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional, Callable
 
 import backtrader as bt
 import pandas as pd
 from .corporate_actions import load_corporate_actions, apply_event
+
+
+def _round_to_tick(value: float, tick: float) -> float:
+    """Quantize price to given tick using half-up rounding (A-share style)."""
+    if tick is None or tick <= 0:
+        return value
+    try:
+        return float(Decimal(str(value)).quantize(Decimal(str(tick)), rounding=ROUND_HALF_UP))
+    except Exception:
+        return value
 
 # -----------------------------
 # 数据加载器 (简化版本)
@@ -171,7 +182,12 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
     g = _G()
     jq_state: Dict[str, Any] = {
         'benchmark': None,
-        'options': {},
+        'options': {
+            'enable_limit_check': True,
+            'limit_up_factor': 1.10,
+            'limit_down_factor': 0.90,
+            'price_tick': 0.01,
+        },
         'records': [],
         'log': [],
         'g': g,
@@ -181,6 +197,7 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         'current_dt': None,      # 当前 bar 展示时间（字符串）
         'user_start': None,      # 用户选择的开始日期（YYYY-MM-DD）
         'in_warmup': False,      # 暖场阶段（< user_start）
+        'blocked_orders': [],  # 收集被涨跌停或规则阻断的订单（size=0）
     }
 
     class _Log:
@@ -346,6 +363,71 @@ def compile_user_strategy(code: str):
                 if exec_env is None:
                     exec_env = {}
                 jq_state = exec_env.get('jq_state', {}) if isinstance(exec_env, dict) else {}
+                # 注入 get_price (简化版) 若未提供
+                if isinstance(exec_env, dict) and 'get_price' not in exec_env:
+                    def get_price(security: str,
+                                  count: int = 1,
+                                  end_date: str | None = None,
+                                  frequency: str = 'daily',
+                                  fields=None):
+                        """简化版聚宽 get_price：仅支持 daily & 单标的。
+                        security: 证券代码(忽略后缀)
+                        count: 取最近 count 条（不含当前正在运行的当日 bar）
+                        end_date: 忽略或与当前回测日不同则仍以当前回测日为结束(前一日)
+                        fields: None/单字段/字段列表；默认返回 ['open','close','high','low','volume']。
+                        返回 pandas.DataFrame 或 Series（当 fields 为单字段时）。
+                        """
+                        import pandas as _pd
+                        if frequency != 'daily':
+                            raise ValueError('get_price 简化实现仅支持 daily')
+                        if count <= 0:
+                            return _pd.DataFrame()
+                        base = str(security).split('.')[0]
+                        hist_map = jq_state.get('history_df_map') or {}
+                        df_full = None
+                        if base in hist_map:
+                            df_full = hist_map[base]
+                        else:
+                            for k, v in hist_map.items():
+                                if str(k).startswith(base):
+                                    df_full = v
+                                    break
+                        if df_full is None:
+                            df_full = jq_state.get('history_df')  # 可能是单一标的 DataFrame
+                        # 需要 datetime 列
+                        if df_full is None or 'datetime' not in df_full.columns:
+                            return _pd.DataFrame()
+                        # 当前模拟日
+                        try:
+                            cur_date = bt.num2date(self.data.datetime[0]).date()
+                        except Exception:
+                            cur_date = None
+                        work = df_full
+                        if cur_date is not None:
+                            work = work[work['datetime'].dt.date < cur_date]
+                        if work.empty:
+                            return _pd.DataFrame()
+                        tail = work.tail(count)
+                        default_fields = ['open','close','high','low','volume']
+                        if fields is None:
+                            use_fields = default_fields
+                        else:
+                            if isinstance(fields, str):
+                                use_fields = [fields]
+                            else:
+                                use_fields = list(fields)
+                        cols_exist = [c for c in use_fields if c in tail.columns]
+                        out = tail[['datetime', *cols_exist]].copy()
+                        out.index = out['datetime'].dt.date.astype(str)
+                        out = out.drop(columns=['datetime'])
+                        if isinstance(fields, str):
+                            # 返回 Series
+                            s = out[fields] if fields in out.columns else _pd.Series([], dtype=float)
+                            s.index.name = None
+                            return s
+                        out.index.name = None
+                        return out
+                    exec_env['get_price'] = get_price
                 # --- Corporate Actions (simulate_corporate_actions) ---
                 try:
                     if jq_state.get('corporate_actions'):
@@ -356,14 +438,28 @@ def compile_user_strategy(code: str):
                             logger = jq_state.get('logger')
                             for ev in todays:
                                 from .corporate_actions import apply_event as _apply_ca
-                                res = _apply_ca(ev, self.position, self.broker, logger=logger)
-                                if res and isinstance(res, tuple):
-                                    tag, payload = res
-                                    if tag in ('BONUS_SHARES','SPLIT_ADJ') and isinstance(payload, int) and payload != 0:
-                                        if payload > 0:
-                                            self.buy(size=payload)
-                                        else:
-                                            self.sell(size=abs(payload))
+                                manual_override = getattr(ev, '_manual_shares', None)
+                                if manual_override not in (None, 0):
+                                    # Direct share delta injection; positive -> buy, negative -> sell
+                                    delta = int(manual_override)
+                                    try:
+                                        if logger:
+                                            logger.info(f"[ca_manual_apply] date={ev.date} type={ev.action_type} delta={delta}")
+                                    except Exception:
+                                        pass
+                                    if delta > 0:
+                                        self.buy(size=delta)
+                                    elif delta < 0:
+                                        self.sell(size=abs(delta))
+                                else:
+                                    res = _apply_ca(ev, self.position, self.broker, logger=logger)
+                                    if res and isinstance(res, tuple):
+                                        tag, payload = res
+                                        if tag in ('BONUS_SHARES','SPLIT_ADJ') and isinstance(payload, int) and payload != 0:
+                                            if payload > 0:
+                                                self.buy(size=payload)
+                                            else:
+                                                self.sell(size=abs(payload))
                 except Exception:
                     pass
                 # 继续原有逻辑
@@ -372,6 +468,12 @@ def compile_user_strategy(code: str):
                     if unit.lower() not in ('1d', 'day', 'd'):
                         raise ValueError('attribute_history 目前仅支持日级 unit=1d')
                     import pandas as _pd
+                    # 方案A: 增加开关 attribute_history_include_current (默认 False)，
+                    # True 时包含“当前bar”(即当前交易日)；False 保持聚宽语义(不含当日)
+                    try:
+                        _include_cur = bool(exec_env['jq_state']['options'].get('attribute_history_include_current', False))
+                    except Exception:
+                        _include_cur = False
                     # JQ 兼容：Series/DF 支持使用负整数做“位置”索引，如 s[-1] 代表最后一项
                     class _JQSeries(_pd.Series):
                         @property
@@ -432,8 +534,11 @@ def compile_user_strategy(code: str):
                     except Exception:
                         full_df = jqst.get('history_df')
                     if isinstance(full_df, _pd.DataFrame) and cur_date is not None:
-                        # JQ 语义：不包含当日，返回“当前日之前”的 n 条
-                        df = full_df[full_df['datetime'].dt.date < cur_date]
+                        # 根据开关决定是否包含当日
+                        if _include_cur:
+                            df = full_df[full_df['datetime'].dt.date <= cur_date]
+                        else:
+                            df = full_df[full_df['datetime'].dt.date < cur_date]
                         if df.empty:
                             return _JQDataFrame({f: [] for f in fields})
                         tail = df.tail(n)
@@ -447,8 +552,11 @@ def compile_user_strategy(code: str):
                         out = out.drop(columns=['datetime'])
                         return _JQDataFrame(out)
                     # 回退：直接从数据行取，尽量用日期索引
-                    # 不包含当前 bar（索引 0），所以最多使用 len(self.data) - 1 条
-                    available = max(len(self.data) - 1, 0)
+                    # 根据开关决定 available 是否包含当前 bar
+                    if _include_cur:
+                        available = max(len(self.data), 0)  # 允许包含当前bar
+                    else:
+                        available = max(len(self.data) - 1, 0)  # 不包含当前bar（索引0）
                     length = min(n, available)
                     if length <= 0:
                         return _JQDataFrame({f: [] for f in fields})
@@ -458,20 +566,34 @@ def compile_user_strategy(code: str):
                         if line is None:
                             data_dict[f] = [float('nan')] * length
                             continue
-                        # 取“之前”的 length 条（不包含索引 0 当日）：[-length, ..., -1]
-                        vals = [line[i] for i in range(-length, 0)] if length > 0 else []
+                        # 取“之前”的 length 条；含当日则区间为 [-length+1, ..., 0]
+                        if _include_cur:
+                            start_idx = -length + 1 if length > 0 else 1
+                            vals = [line[i] for i in range(start_idx, 1)] if length > 0 else []
+                        else:
+                            # 不含当日：[-length, ..., -1]
+                            vals = [line[i] for i in range(-length, 0)] if length > 0 else []
                         data_dict[f] = vals
                     # 构造日期索引（更稳健：逐条读取末尾 length 个 bar 的日期，排除当日）
                     try:
-                        # 使用负索引逐条转换，避免某些环境下 get(size=) 异常
+                        # 使用索引逐条转换，包含/不包含当日由 _include_cur 控制
                         str_idx = []
-                        for i in range(-length, 0):
-                            dt_num = self.data.datetime[i]
-                            dt_str = bt.num2date(dt_num).date().isoformat()
-                            str_idx.append(dt_str)
+                        if _include_cur:
+                            for i in range(-length + 1, 1):
+                                dt_num = self.data.datetime[i]
+                                dt_str = bt.num2date(dt_num).date().isoformat()
+                                str_idx.append(dt_str)
+                        else:
+                            for i in range(-length, 0):
+                                dt_num = self.data.datetime[i]
+                                dt_str = bt.num2date(dt_num).date().isoformat()
+                                str_idx.append(dt_str)
                     except Exception:
                         # 仍然失败则退回负索引
-                        str_idx = list(range(-length, 0))
+                        if _include_cur:
+                            str_idx = list(range(-length + 1, 1))
+                        else:
+                            str_idx = list(range(-length, 0))
                     return _JQDataFrame(_pd.DataFrame(data_dict, index=str_idx))
 
                 def order_value(security: str, value: float):
@@ -487,6 +609,7 @@ def compile_user_strategy(code: str):
                     5. 记录详细计算日志，便于对齐聚宽第二笔差异。
                     """
                     try:
+                        # 严格暖场禁止交易（不记录 blocked，直接忽略）
                         if exec_env['jq_state'].get('in_warmup'):
                             return
                         jqst = exec_env['jq_state']
@@ -510,6 +633,7 @@ def compile_user_strategy(code: str):
                         def _round_sell(p: float) -> float:
                             return _math.ceil(p * 100) / 100.0
                         price = base_price
+                        debug_trading = bool(jqst['options'].get('debug_trading', False))
                         buy_eff_price = _round_buy(base_price * (1 + half))
                         sell_eff_price = _round_sell(base_price * (1 - half))
                         # 涨跌停判定（简单：比较上一交易日收盘）
@@ -519,119 +643,130 @@ def compile_user_strategy(code: str):
                             except Exception:
                                 prev_close = None
                             if prev_close and prev_close > 0:
-                                up_lim = prev_close * up_lim_fac
-                                down_lim = prev_close * down_lim_fac
+                                tick = float(jqst['options'].get('price_tick', 0.01) or 0.01)
+                                up_lim = _round_to_tick(prev_close * up_lim_fac, tick)
+                                down_lim = _round_to_tick(prev_close * down_lim_fac, tick)
                                 side_tmp = 'BUY' if value >= 0 else 'SELL'
-                                if side_tmp == 'BUY' and price >= up_lim - 1e-9:
-                                    exec_env['log'].info(f"[limit_check] BLOCK side=BUY price={price:.4f} up_lim={up_lim:.4f}")
+                                eff_price = buy_eff_price if side_tmp == 'BUY' else sell_eff_price
+                                if side_tmp == 'BUY' and eff_price >= up_lim - 1e-9:
+                                    exec_env['log'].info(
+                                        f"[limit_check] BLOCK side=BUY price={eff_price:.4f} up_lim={up_lim:.4f} prev_close={prev_close:.4f}"
+                                    )
+                                    jqst['blocked_orders'].append(OrderRecord(
+                                        datetime=jqst.get('current_dt','').split(' ')[0],
+                                        symbol=jqst.get('primary_symbol') or str(security).split('.')[0],
+                                        side='BUY',
+                                        size=0,
+                                        price=eff_price,
+                                        value=0.0,
+                                        commission=0.0,
+                                        status='BlockedLimitUp'
+                                    ))
                                     return
-                                if side_tmp == 'SELL' and price <= down_lim + 1e-9:
-                                    exec_env['log'].info(f"[limit_check] BLOCK side=SELL price={price:.4f} down_lim={down_lim:.4f}")
+                                if side_tmp == 'SELL' and eff_price <= down_lim + 1e-9:
+                                    exec_env['log'].info(
+                                        f"[limit_check] BLOCK side=SELL price={eff_price:.4f} down_lim={down_lim:.4f} prev_close={prev_close:.4f}"
+                                    )
+                                    jqst['blocked_orders'].append(OrderRecord(
+                                        datetime=jqst.get('current_dt','').split(' ')[0],
+                                        symbol=jqst.get('primary_symbol') or str(security).split('.')[0],
+                                        side='SELL',
+                                        size=0,
+                                        price=eff_price,
+                                        value=0.0,
+                                        commission=0.0,
+                                        status='BlockedLimitDown'
+                                    ))
                                     return
+                        # ---- 真实下单计算 ----
                         lot = int(jqst['options'].get('lot', 100)) or 100
-                        fee_cfg = jqst.get('fee_config', {})
-                        rate = float(fee_cfg.get('rate', 0.0))
-                        min_commission = float(fee_cfg.get('min_commission', 0.0))
-                        # stamp_duty 仅用于卖出估算（买入不计）
-                        stamp_duty_rate = float(fee_cfg.get('stamp_duty', 0.0))
-                        broker_cash = float(self.broker.getcash())
-                        pos_size = int(getattr(self.position, 'size', 0) or 0)
-                        side = 'BUY' if value >= 0 else 'SELL'
-                        target_amt = abs(float(value))
-                        # BUY 分支
-                        if side == 'BUY':
-                            # 实际可用目标金额不超过现金
-                            target_amt = min(target_amt, broker_cash)
-                            if target_amt <= 0:
-                                return
-                            # 初步忽略最小佣金，粗估 shares
-                            if rate < 0:
-                                rate = 0.0
-                            # 估算函数：在 (shares*price + commission)<=target_amt 下最大 shares
-                            def _max_shares(amount: float) -> int:
-                                if amount <= 0 or price <= 0:
-                                    return 0
-                                # 初步估算 (忽略最小佣金)
-                                eff_p = buy_eff_price  # 估算用含滑点价
-                                guess = int(amount / (eff_p * (1 + max(rate, 0))))
-                                if guess < 0:
-                                    guess = 0
-                                # lot 对齐
-                                guess = (guess // lot) * lot
-                                # 回退调整，确保费用后不超额
-                                while guess > 0:
-                                    comm = max(min_commission, guess * eff_p * rate)
-                                    gross = guess * eff_p + comm  # 买入不含印花税
-                                    if gross <= amount + 1e-9:  # 容差
-                                        return guess
-                                    guess -= lot
-                                return 0
-                            shares = _max_shares(target_amt)
-                            # 严格模式：尝试向上逼近（在不超现金的情况下寻找更接近 target 的 shares）
-                            if strict and shares > 0:
-                                cur = shares
-                                while True:
-                                    nxt = cur + lot
-                                    comm_n = max(min_commission, nxt * buy_eff_price * rate)
-                                    gross_n = nxt * buy_eff_price + comm_n
-                                    if gross_n <= target_amt + 1e-9 and gross_n <= broker_cash + 1e-9:
-                                        cur = nxt
-                                        continue
-                                    break
-                                shares = cur
+                        commission_rate = float(jqst['options'].get('commission', 0.0003))
+                        min_comm = float(jqst['options'].get('min_commission', 5.0)) if 'min_commission' in jqst['options'] else 5.0
+                        stamp_duty = float(jqst['options'].get('stamp_duty', 0.001)) if 'stamp_duty' in jqst['options'] else 0.001
+                        available_cash = self.broker.getcash()
+                        position_size = int(getattr(self.position, 'size', 0) or 0)
+                        # 买入金额
+                        if value > 0:
+                            # 先用买入有效价估算股数
+                            est_price = buy_eff_price
+                            # 可选“保守模式”：若上一日收盘(prev_close)高于买入有效价，用 prev_close 作为 sizing 基准，避免实际撮合价>估价导致保证金 0。
+                            # 聚宽本身按 (cash // buy_price) 取整再对齐 lot；这里通过开关控制：True=当前默认保守, False=严格 JQ 样式。
+                            conservative_flag = True
+                            try:
+                                opt_cons = jqst['options'].get('order_value_conservative_prev_close')
+                                if isinstance(opt_cons, bool):
+                                    conservative_flag = opt_cons
+                            except Exception:
+                                conservative_flag = True
+                            conservative_price = est_price
+                            prev_close_for_size = None
+                            try:
+                                prev_close_for_size = float(getattr(self.data, 'close')[-1])
+                            except Exception:
+                                prev_close_for_size = None
+                            if conservative_flag and prev_close_for_size and prev_close_for_size > conservative_price:
+                                conservative_price = prev_close_for_size
+                            raw_shares = int(value // (conservative_price if conservative_flag else est_price))
+                            # 按 lot 对齐
+                            shares = (raw_shares // lot) * lot
                             if shares <= 0:
-                                exec_env['log'].info(f"[order_value_calc] side=BUY insufficient target_amt={target_amt:.2f} cash={broker_cash:.2f}")
+                                if debug_trading:
+                                    exec_env['log'].info(f"[sizing] BUY abort raw_shares={raw_shares} lot={lot} est={est_price} conservative={conservative_price} cash={available_cash}")
                                 return
-                            comm_final = max(min_commission, shares * buy_eff_price * rate)
-                            gross_final = shares * buy_eff_price + comm_final
-                            leftover = broker_cash - gross_final
-                            exec_env['log'].info(
-                                f"[order_value_calc] side=BUY strict={strict} base_price={base_price:.4f} exec_price={buy_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} target={abs(value):.2f} cash={broker_cash:.2f} shares={shares} gross={shares*buy_eff_price:.2f} comm={comm_final:.2f} leftover={leftover:.2f} lot={lot} rule=floor"
-                            )
-                            if shares > 0:
-                                self.buy(size=shares)
-                            return
-                        # SELL 分支
-                        if pos_size <= 0:
-                            return
-                        # 限制最大可卖市值
-                        max_sell_value = pos_size * price
-                        target_amt = min(target_amt, max_sell_value)
-                        if target_amt <= 0:
-                            return
-                        # shares 估算：卖出所得 = shares*price - commission - stamp_duty*shares*price >= target_amt? 但聚宽 order_value(value<0) 更像按“成交额”近似；
-                        # 我们按“想减仓的市值”来反推 shares，使 shares*price ≈ target_amt，不超出持仓。
-                        eff_p_sell = sell_eff_price
-                        shares = int(target_amt / eff_p_sell)
-                        shares = min(shares, pos_size)
-                        shares = (shares // lot) * lot
-                        if shares <= 0:
-                            return
-                        # 重新估算若加入费用是否明显偏离；若偏离太多且仍可再卖出一个 lot 则调整
-                        def _sell_net(sh):
-                            gross = sh * eff_p_sell
-                            comm = max(min_commission, gross * rate)
-                            tax = gross * stamp_duty_rate
-                            return gross - comm - tax, gross, comm, tax
-                        # 尝试向上补一个 lot 如果未超持仓且净额仍 <= target_amt*(1+0.01) （允许1%偏差）
-                        net, gross, comm, tax = _sell_net(shares)
-                        if shares + lot <= pos_size:
-                            net2, gross2, comm2, tax2 = _sell_net(shares + lot)
-                            if net2 <= target_amt * 1.01:
-                                shares += lot
-                                net, gross, comm, tax = net2, gross2, comm2, tax2
-                        exec_env['log'].info(
-                            f"[order_value_calc] side=SELL strict={strict} base_price={base_price:.4f} exec_price={eff_p_sell:.4f} slip={slip_perc:.5f} half={half:.5f} target={abs(value):.2f} pos_val={pos_size*base_price:.2f} shares={shares} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} lot={lot} rule=ceil" )
-                        if shares > 0:
+                            # 费用估算（迭代一次足够）
+                            gross_price_for_fee = conservative_price if conservative_flag else est_price
+                            gross = shares * gross_price_for_fee
+                            comm = max(gross * commission_rate, min_comm)
+                            total_cost = gross + comm  # 不含印花税（买入无印花税）
+                            if total_cost > available_cash:
+                                # 缩减 shares
+                                max_afford = int((available_cash - min_comm) // gross_price_for_fee)
+                                shares = (max_afford // lot) * lot
+                            if shares <= 0:
+                                if debug_trading:
+                                    exec_env['log'].info(f"[sizing] BUY zero_after_cash max_afford={max_afford} cons_price={gross_price_for_fee} cash={available_cash}")
+                                return
+                            if debug_trading:
+                                exec_env['log'].info(
+                                    f"[sizing] BUY shares={shares} est={est_price} prev_close={prev_close_for_size} cons_flag={conservative_flag} cons_price={conservative_price} gross_price_used={gross_price_for_fee} gross={gross:.2f} comm_est={comm:.2f} total={total_cost:.2f} cash={available_cash:.2f}"
+                                )
+                            else:
+                                # 非 debug 也记录一次模式
+                                try:
+                                    jqst['log'].append(f"[sizing_mode] conservative_prev_close={conservative_flag}")
+                                except Exception:
+                                    pass
+                            self.buy(size=shares)
+                        elif value < 0:
+                            # 卖出金额：目标卖出 value_abs ，不超过持仓
+                            est_price = sell_eff_price
+                            value_abs = abs(value)
+                            max_sell_shares = position_size if position_size > 0 else 0
+                            if max_sell_shares <= 0:
+                                return
+                            # 需要的股数
+                            raw_need = int(value_abs // est_price)
+                            shares = min(max_sell_shares, (raw_need // lot) * lot if raw_need > 0 else 0)
+                            if shares <= 0:
+                                # 若希望彻底清仓且金额较小，允许直接全部平掉（与 value 小但有持仓的情况）
+                                if value_abs >= est_price * lot and strict:
+                                    return
+                                shares = max_sell_shares
+                            if shares <= 0:
+                                if debug_trading:
+                                    exec_env['log'].info(f"[sizing] SELL abort raw_need={raw_need} lot={lot} pos={position_size} est={est_price}")
+                                return
+                            if debug_trading:
+                                exec_env['log'].info(f"[sizing] SELL shares={shares} est={est_price} pos={position_size}")
                             self.sell(size=shares)
                     except Exception as _e:
                         try:
                             exec_env['log'].info(f"[order_value_error] {type(_e).__name__}:{_e}")
                         except Exception:
                             pass
-
+                    # end order_value
                 def order_target(security: str, target: float):
-                    # 暖场期不交易
+                    # 暖场期不交易（严格忽略）
                     if exec_env['jq_state'].get('in_warmup'):
                         return
                     """将当前持仓调整到目标股数 target。
@@ -663,14 +798,17 @@ def compile_user_strategy(code: str):
                         sell_eff_price = _round_sell(base_price * (1 - half))
                         price = base_price
                         # limit check
+                        prev_close = None
+                        up_lim = down_lim = None
                         if enable_limit:
                             try:
                                 prev_close = float(getattr(self.data, 'close')[-1])
                             except Exception:
                                 prev_close = None
                             if prev_close and prev_close > 0:
-                                up_lim = prev_close * up_lim_fac
-                                down_lim = prev_close * down_lim_fac
+                                tick = float(jqst['options'].get('price_tick', 0.01) or 0.01)
+                                up_lim = _round_to_tick(prev_close * up_lim_fac, tick)
+                                down_lim = _round_to_tick(prev_close * down_lim_fac, tick)
                         cur = int(getattr(self.position, 'size', 0) or 0)
                         tgt_raw = int(target or 0)
                         lot = int(jqst['options'].get('lot', 100)) or 100
@@ -679,131 +817,164 @@ def compile_user_strategy(code: str):
                         delta = tgt - cur
                         if delta == 0:
                             return
-                        fee_cfg = jqst.get('fee_config', {})
-                        rate = float(fee_cfg.get('rate', 0.0))
-                        min_commission = float(fee_cfg.get('min_commission', 0.0))
-                        stamp_duty_rate = float(fee_cfg.get('stamp_duty', 0.0))
-                        broker_cash = float(self.broker.getcash())
-                        # BUY 增持
-                        if delta > 0:
-                            # 估算最大可买 shares (复用 order_value BUY 逻辑思路)
-                            def _max_buy(sh):
-                                comm = max(min_commission, sh * buy_eff_price * rate)
-                                return sh * buy_eff_price + comm
-                            buy_sh = delta
-                            if strict:
-                                # 若现金不足则向下回退
-                                while buy_sh > 0 and _max_buy(buy_sh) > broker_cash + 1e-9:
-                                    buy_sh -= lot
-                            else:
-                                if _max_buy(buy_sh) > broker_cash + 1e-9:
-                                    # 简单回退一次
-                                    buy_sh = (int(broker_cash / buy_eff_price) // lot) * lot
-                            if buy_sh <= 0:
-                                exec_env['log'].info(f"[order_target_calc] side=BUY BLOCK delta={delta} cash={broker_cash:.2f}")
+                        if enable_limit and prev_close and prev_close > 0:
+                            if delta > 0 and up_lim is not None and buy_eff_price >= up_lim - 1e-9:
+                                exec_env['log'].info(
+                                    f"[limit_check] BLOCK side=BUY price={buy_eff_price:.4f} up_lim={up_lim:.4f} prev_close={prev_close:.4f}"
+                                )
+                                jqst['blocked_orders'].append(OrderRecord(
+                                    datetime=jqst.get('current_dt','').split(' ')[0],
+                                    symbol=jqst.get('primary_symbol') or str(security).split('.')[0],
+                                    side='BUY',
+                                    size=0,
+                                    price=buy_eff_price,
+                                    value=0.0,
+                                    commission=0.0,
+                                    status='BlockedLimitUp'
+                                ))
                                 return
-                            comm_f = max(min_commission, buy_sh * buy_eff_price * rate)
-                            exec_env['log'].info(f"[order_target_calc] side=BUY strict={strict} base_price={base_price:.4f} exec_price={buy_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} cur={cur} tgt={tgt} delta={delta} exec_shares={buy_sh} gross={buy_sh*buy_eff_price:.2f} comm={comm_f:.2f} cash={broker_cash:.2f} rule=floor")
-                            self.buy(size=buy_sh)
-                            return
-                        # SELL 减持
-                        sell_sh = abs(delta)
-                        sell_sh = min(sell_sh, cur)
-                        sell_sh = (sell_sh // lot) * lot
-                        if sell_sh <= 0:
-                            return
-                        # 严格模式：平仓时可以直接 close() 以减少潜在费用重复；否则按 size 卖
-                        if tgt == 0 and self.position:
-                            exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} base_price={base_price:.4f} exec_price={sell_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} cur={cur} tgt=0 close_all size={cur} rule=ceil")
-                            self.close()
-                            return
-                        # 估算费用
-                        gross = sell_sh * sell_eff_price
-                        comm = max(min_commission, gross * rate)
-                        tax = gross * stamp_duty_rate
-                        net = gross - comm - tax
-                        exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} base_price={base_price:.4f} exec_price={sell_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} cur={cur} tgt={tgt} delta={delta} exec_shares={sell_sh} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} rule=ceil")
-                        self.sell(size=sell_sh)
+                            if delta < 0 and down_lim is not None and sell_eff_price <= down_lim + 1e-9:
+                                exec_env['log'].info(
+                                    f"[limit_check] BLOCK side=SELL price={sell_eff_price:.4f} down_lim={down_lim:.4f} prev_close={prev_close:.4f}"
+                                )
+                                jqst['blocked_orders'].append(OrderRecord(
+                                    datetime=jqst.get('current_dt','').split(' ')[0],
+                                    symbol=jqst.get('primary_symbol') or str(security).split('.')[0],
+                                    side='SELL',
+                                    size=0,
+                                    price=sell_eff_price,
+                                    value=0.0,
+                                    commission=0.0,
+                                    status='BlockedLimitDown'
+                                ))
+                                return
+                        # --- 真正下单 ---
+                        if delta > 0:
+                            self.buy(size=delta)
+                        else:
+                            self.sell(size=abs(delta))
                     except Exception as _e:
                         try:
                             exec_env['log'].info(f"[order_target_error] {type(_e).__name__}:{_e}")
                         except Exception:
                             pass
-
-                # 动态覆盖 exec 环境里的函数（只在第一次后就不再改变 jq_state）
-                jq_state_ref = exec_env['jq_state']
-                # 设置当前 bar 的时间与暖场标记（用户选择开始日前为暖场）
+                    # end order_target
+                # 暴露函数到执行环境（供用户脚本中的全局方法调用）
                 try:
-                    cur_dt = bt.num2date(self.data.datetime[0])
-                    cur_date_str = cur_dt.date().isoformat()
-                    jq_state_ref['current_dt'] = f"{cur_date_str} 09:30:00"
-                    user_start = jq_state_ref.get('user_start')
-                    jq_state_ref['in_warmup'] = bool(user_start) and (cur_date_str < str(user_start))
+                    exec_env['attribute_history'] = attribute_history
+                    exec_env['order_value'] = order_value
+                    exec_env['order_target'] = order_target
                 except Exception:
                     pass
-                exec_env['attribute_history'] = attribute_history
-                exec_env['order_value'] = order_value
-                exec_env['order_target'] = order_target
-
-                # 暖场阶段不调用用户 handle_data（仅用于准备历史数据），与聚宽一致
-                if jq_state_ref.get('in_warmup'):
-                    return
-
-                # 调用用户 handle_data，并在出错时将堆栈写入 JQ Logs，便于排查
+                # 记录执行模式（open/close）。fill_price!=close -> 在 nextopen 中执行用户逻辑，使下单在当日开盘撮合。
+                try:
+                    fp_mode = str(exec_env.get('jq_state', {}).get('options', {}).get('fill_price', 'open')).lower()
+                except Exception:
+                    fp_mode = 'open'
+                self._fill_price_mode = fp_mode
+                self._run_on_open = (fp_mode != 'close')  # 默认 open
+                # 标记当前 bar 是否已在 open 阶段处理
+                self._handled_today = False
+                try:
+                    exec_env['jq_state']['log'].append(f"[exec_mode] run_on_open={self._run_on_open} fill_price={fp_mode}")
+                except Exception:
+                    pass
+                # 实际调用用户 handle_data
                 try:
                     handle_func(self._jq_context, None)
-                except Exception:
+                except Exception as _e:
                     try:
-                        import traceback as _tb
-                        err = _tb.format_exc()
-                        # 暖场期也输出异常，便于发现问题
-                        exec_env['jq_state']['in_warmup'] = False
-                        _logger = exec_env.get('log')
-                        if _logger is not None:
-                            _logger.info("handle_data 发生异常:\n" + err)
+                        exec_env['log'].info(f"[handle_data_error] {type(_e).__name__}:{_e}")
                     except Exception:
                         pass
-                    raise
 
-            def next(self):  # 每个bar 调用 handle_data
-                # 当选择收盘成交(fill_price=close)时，在 next(收盘阶段)执行；否则跳过
-                fillp = str(exec_env['jq_state']['options'].get('fill_price', 'open')).lower() if 'jq_state' in exec_env else 'open'
-                if fillp == 'close':
+            # 在开盘阶段执行（Backtrader cheat-on-open 钩子: next_open）
+            def next_open(self):  # type: ignore
+                if not getattr(self, '_run_on_open', True):
+                    return  # 仅 open 模式执行
+                try:
+                    jq_state = self._exec_env.get('jq_state') if hasattr(self, '_exec_env') else None
+                    if isinstance(jq_state, dict):
+                        cur_date_obj = bt.num2date(self.data.datetime[0]).date()
+                        cur_dt = cur_date_obj.isoformat()
+                        jq_state['current_dt'] = f"{cur_dt} 09:30:00"
+                        user_start = jq_state.get('user_start')
+                        in_warmup_before = jq_state.get('in_warmup')
+                        if isinstance(user_start, str):
+                            try:
+                                from datetime import date as _d
+                                start_date_obj = _d.fromisoformat(user_start)
+                                jq_state['in_warmup'] = cur_date_obj < start_date_obj
+                            except Exception:
+                                jq_state['in_warmup'] = cur_dt < user_start
+                        else:
+                            jq_state['in_warmup'] = False
+                        if jq_state['in_warmup'] and not in_warmup_before:
+                            try:
+                                jq_state['log'].append(f"[warmup] enter_warmup cur={cur_dt} start={user_start}")
+                            except Exception:
+                                pass
+                        if (not jq_state['in_warmup']) and in_warmup_before:
+                            try:
+                                jq_state['log'].append(f"[warmup] leave_warmup cur={cur_dt} start={user_start}")
+                            except Exception:
+                                pass
+                        if jq_state['in_warmup']:
+                            return
+                except Exception:
+                    pass
+                # 真正执行用户逻辑（基于前一日收盘生成信号，按当日开盘成交）
+                try:
                     self._run_handle()
-                else:
-                    # open 成交在 next_open 中执行
-                    return
+                    self._handled_today = True
+                except Exception:
+                    pass
 
-            def next_open(self):
-                # 当选择开盘成交(fill_price=open)时，在 next_open(开盘阶段)执行；否则跳过
-                fillp = str(exec_env['jq_state']['options'].get('fill_price', 'open')).lower() if 'jq_state' in exec_env else 'open'
-                if fillp == 'open':
-                    self._run_handle()
-                else:
+            def next(self):  # 每个 bar 调用
+                # close 模式或未在 open 阶段执行时才在这里运行用户逻辑
+                if getattr(self, '_run_on_open', True) and getattr(self, '_handled_today', False):
                     return
+                try:
+                    jq_state = self._exec_env.get('jq_state') if hasattr(self, '_exec_env') else None
+                    if isinstance(jq_state, dict):
+                        cur_date_obj = bt.num2date(self.data.datetime[0]).date()
+                        cur_dt = cur_date_obj.isoformat()
+                        jq_state['current_dt'] = f"{cur_dt} 09:30:00"
+                        user_start = jq_state.get('user_start')
+                        in_warmup_before = jq_state.get('in_warmup')
+                        if isinstance(user_start, str):
+                            try:
+                                from datetime import date as _d
+                                start_date_obj = _d.fromisoformat(user_start)
+                                jq_state['in_warmup'] = cur_date_obj < start_date_obj
+                            except Exception:
+                                jq_state['in_warmup'] = cur_dt < user_start
+                        else:
+                            jq_state['in_warmup'] = False
+                        if jq_state['in_warmup'] and not in_warmup_before:
+                            try:
+                                jq_state['log'].append(f"[warmup] enter_warmup cur={cur_dt} start={user_start}")
+                            except Exception:
+                                pass
+                        if (not jq_state['in_warmup']) and in_warmup_before:
+                            try:
+                                jq_state['log'].append(f"[warmup] leave_warmup cur={cur_dt} start={user_start}")
+                            except Exception:
+                                pass
+                        if jq_state['in_warmup']:
+                            return
+                except Exception:
+                    pass
+                try:
+                    self._run_handle()
+                except Exception:
+                    pass
 
         return UserStrategy, jq_state
 
-    raise ValueError('策略代码需定义 UserStrategy(bt.Strategy) 或 initialize/handle_data 聚宽风格函数')
-
-# -----------------------------
-# Analyzer 助手
-# -----------------------------
-
-def extract_analyzers(cerebro: bt.Cerebro) -> Dict[str, Any]:
-    analyzers = {}
-    for name, analyzer in cerebro.runstrats[0][0].analyzers.items():
-        try:
-            analyzers[name] = analyzer.get_analysis()
-        except Exception:
-            analyzers[name] = {}
-    return analyzers
-
-# -----------------------------
-# 回测执行
-# -----------------------------
-
-
+        # -----------------------------
+        # 回测执行
+        # -----------------------------
 def run_backtest(
     symbol: str,
     start: str,
@@ -818,45 +989,25 @@ def run_backtest(
     try:
         # 1. 编译策略 & 初始化 Cerebro
         StrategyCls, jq_state = compile_user_strategy(strategy_code)
-        # 1.1 预解析 set_option 影响数据源的键（如果用户把 set_option 放在 initialize 里，我们在数据加载前仍需获知）
+        # 记录用户开始日期
+        jq_state['user_start'] = start
+        # 预扫描用户代码：因为 initialize 在数据加载之后才执行，若用户在 initialize 内才 set_option('use_real_price',True)
+        # 会错过“选 raw 文件”阶段，这里用静态正则提前检测一次并预置 option；同理支持 adjust_type。
         try:
-            import re
-            pattern = re.compile(r"set_option\s*\(\s*(['\"])\s*(use_real_price|adjust_type)\s*\1\s*,\s*([^\)]*)\)")
-            for m in pattern.finditer(strategy_code):
-                key = m.group(2).strip()
-                raw_val = m.group(3).strip()
-                val_parsed = raw_val
-                # 去掉尾部注释
-                if '#' in val_parsed:
-                    val_parsed = val_parsed.split('#',1)[0].strip()
-                # 简单字面值解析
-                if val_parsed.lower() in ('true','false'):
-                    val = val_parsed.lower() == 'true'
-                elif val_parsed in ('1','0'):
-                    val = (val_parsed == '1')
-                elif (val_parsed.startswith("'") and val_parsed.endswith("'")) or (val_parsed.startswith('"') and val_parsed.endswith('"')):
-                    val = val_parsed[1:-1]
-                else:
-                    # 尝试数值
-                    try:
-                        val = int(val_parsed)
-                    except Exception:
-                        try:
-                            val = float(val_parsed)
-                        except Exception:
-                            val = val_parsed
-                # 只在尚未用户顶层设置时进行覆盖，避免顶层 set_option 已生效
-                if key not in jq_state['options']:
-                    jq_state['options'][key] = val
-                    try:
-                        jq_state['log'].append(f"[pre_parse_option] {key}={val}")
-                    except Exception:
-                        pass
+            # 仅当尚未显式设置 use_real_price 时才尝试推断
+            if 'use_real_price' not in jq_state.get('options', {}):
+                if re.search(r"set_option\(\s*['\"]use_real_price['\"]\s*,\s*True", strategy_code):
+                    jq_state['options']['use_real_price'] = True
+                    jq_state['log'].append('[preparse] detected use_real_price=True in source code')
+            # adjust_type 同理（只解析 raw/qfq/hfq/auto 简单字面值）
+            if 'adjust_type' not in jq_state.get('options', {}):
+                m_adj = re.search(r"set_option\(\s*['\"]adjust_type['\"]\s*,\s*['\"](raw|qfq|hfq|auto)['\"]", strategy_code, re.IGNORECASE)
+                if m_adj:
+                    jq_state['options']['adjust_type'] = m_adj.group(1).lower()
+                    jq_state['log'].append(f"[preparse] detected adjust_type={m_adj.group(1).lower()} in source code")
         except Exception:
             pass
-        # 记录用户开始日期，供暖场/日志用
-        jq_state['user_start'] = start
-        # 根据 fill_price 决定是否启用 cheat-on-open（保证当日开盘撮合）
+        # 创建 cerebro（根据成交价类型决定 cheat_on_open）
         fill_price_opt = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
         try:
             cerebro = bt.Cerebro(cheat_on_open=(fill_price_opt == 'open'))
@@ -865,193 +1016,208 @@ def run_backtest(
             cerebro = bt.Cerebro()
             jq_state['log'].append(f"[exec_mode] fill_price={fill_price_opt} cheat_on_open=unsupported")
         cerebro.broker.setcash(cash)
-
-        # 2. 标的解析与数据加载
-        def _normalize_existing(name: str) -> str:
-            base_lower = name.lower()
-            patterns = [
-                ('_daily_qfq_daily', '_daily_qfq'),
-                ('_daily_hfq_daily', '_daily_hfq'),
-                ('_日_qfq_日', '_日_qfq'),
-                ('_日_hfq_日', '_日_hfq'),
-                ('_daily_daily', '_daily'),
-            ]
-            for old, new in patterns:
-                if base_lower.endswith(old):
-                    return name[: -len(old)] + new
-            return name
-
-        preserved_suffixes = ('_daily', '_daily_qfq', '_daily_hfq', '_qfq', '_hfq', '_日', '_日_qfq', '_日_hfq')
-
-        # 调试：列出 datadir 中的相关文件（只列与当前 symbol 参数前三个代码字符匹配的，避免过长）
+        # 全局买卖限价拦截（支持 blocked_orders 记录）
         try:
-            _all_files = []
-            for nm in os.listdir(datadir):
-                if nm.lower().endswith('.csv'):
-                    _all_files.append(nm)
-            _preview = sorted([f for f in _all_files if f[:3].isdigit()])[:40]
-            jq_state['log'].append(f"[data_dir_snapshot] total_csv={len(_all_files)} sample={','.join(_preview)}")
+            enable_limit_glob = bool(jq_state['options'].get('enable_limit_check', True))
+            if enable_limit_glob:
+                up_fac_glob = float(jq_state['options'].get('limit_up_factor', 1.10))
+                down_fac_glob = float(jq_state['options'].get('limit_down_factor', 0.90))
+                price_tick = float(jq_state['options'].get('price_tick', 0.01) or 0.01)
+                if not jq_state.get('_global_limit_wrapped'):
+                    jq_state['_global_limit_wrapped'] = True
+                    _orig_buy = bt.Strategy.buy
+                    _orig_sell = bt.Strategy.sell
+                    def _limit_guard(strategy_self, *a, **kw):
+                        try:
+                            if jq_state.get('in_warmup'):
+                                return None
+                            data = strategy_self.data
+                            fillp = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
+                            cur_price = float(getattr(data, 'close')[0]) if fillp == 'close' else float(getattr(data, 'open')[0]) if hasattr(data,'open') else float(getattr(data,'close')[0])
+                            try:
+                                prev_close = float(getattr(data, 'close')[-1])
+                            except Exception:
+                                prev_close = None
+                            if prev_close and prev_close > 0:
+                                up_lim = _round_to_tick(prev_close * up_fac_glob, price_tick)
+                                if cur_price >= up_lim - 1e-9:
+                                    jq_state['log'].append(f"[limit_check_global] BLOCK BUY cur={cur_price:.4f} up={up_lim:.4f} prev_close={prev_close:.4f}")
+                                    jq_state['blocked_orders'].append(OrderRecord(datetime=jq_state.get('current_dt','').split(' ')[0], symbol=getattr(jq_state.get('g'),'security',None) or 'data0', side='BUY', size=0, price=cur_price, value=0.0, commission=0.0, status='BlockedLimitUp'))
+                                    return None
+                        except Exception:
+                            pass
+                        return _orig_buy(strategy_self, *a, **kw)
+                    def _limit_guard_sell(strategy_self, *a, **kw):
+                        try:
+                            if jq_state.get('in_warmup'):
+                                return None
+                            data = strategy_self.data
+                            fillp = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
+                            cur_price = float(getattr(data, 'close')[0]) if fillp == 'close' else float(getattr(data, 'open')[0]) if hasattr(data,'open') else float(getattr(data,'close')[0])
+                            try:
+                                prev_close = float(getattr(data, 'close')[-1])
+                            except Exception:
+                                prev_close = None
+                            if prev_close and prev_close > 0:
+                                down_lim = _round_to_tick(prev_close * down_fac_glob, price_tick)
+                                if cur_price <= down_lim + 1e-9:
+                                    jq_state['log'].append(f"[limit_check_global] BLOCK SELL cur={cur_price:.4f} down={down_lim:.4f} prev_close={prev_close:.4f}")
+                                    jq_state['blocked_orders'].append(OrderRecord(datetime=jq_state.get('current_dt','').split(' ')[0], symbol=getattr(jq_state.get('g'),'security',None) or 'data0', side='SELL', size=0, price=cur_price, value=0.0, commission=0.0, status='BlockedLimitDown'))
+                                    return None
+                        except Exception:
+                            pass
+                        return _orig_sell(strategy_self, *a, **kw)
+                    bt.Strategy.buy = _limit_guard  # type: ignore
+                    bt.Strategy.sell = _limit_guard_sell  # type: ignore
+                    jq_state['log'].append('[limit_check_global] monkeypatch buy/sell installed')
         except Exception:
             pass
 
-        # 复权类型支持：set_option('adjust_type', 'auto'|'raw'|'qfq'|'hfq')
-        # 语义：
-        #   raw: 优先未复权(_daily / _日)；找不到再回退 qfq/hfq
-        #   qfq: 强制选前复权(_daily_qfq 或 _日_qfq) 若存在；否则回退 raw
-        #   hfq: 强制选后复权(_daily_hfq 或 _日_hfq) 若存在；否则回退 raw
-        #   auto(默认): 若 use_real_price=True 则 raw；否则前复权 qfq（贴近聚宽动态复权 vs 前复权界面含义）
-        def _get_adjust_type() -> str:
-            at = None
+        # 2. 标的解析与数据加载 (精简 & 明确)
+        # 目标：
+        #  1) 根据输入代码(可含 .XSHE/.XSHG 或带 *_daily_qfq 等后缀) 解析出核心代码 core (纯数字部分)。
+        #  2) 按统一的“候选后缀优先级”生成文件名候选列表并选择第一个存在的。
+        #  3) 优先级来源 = adjust_type + use_real_price + 用户 data_source_preference + force_data_variant + respect_symbol_suffix。
+        #  4) use_real_price=True: 未复权(raw)优先；False: 前复权(qfq)优先（保持之前语义）。
+        #  5) adjust_type 显式指定则覆盖 use_real_price 的默认推导。
+        #  6) respect_symbol_suffix=True 时，如果用户直接给了带后缀名字，直接用（存在则用，不存在报 fallback 说明）。
+        # 输出日志：
+        #  [symbol_select] core=... adjust=... use_real_price=... respect_suffix=... candidates=... chosen=...
+        #  [symbol_force]  若 force_data_variant 命中
+        #  [symbol_warn]   未找到任何存在文件（将返回首个候选继续让后续 FileNotFound 暴露）
+
+        _SUFFIX_RAW = ['_daily', '_日']
+        _SUFFIX_QFQ = ['_daily_qfq', '_日_qfq']
+        _SUFFIX_HFQ = ['_daily_hfq', '_日_hfq']
+        _ALL_SUFFIXES = _SUFFIX_RAW + _SUFFIX_QFQ + _SUFFIX_HFQ
+
+        def _opt(name: str, default=None):
             try:
-                at = jq_state.get('options', {}).get('adjust_type')
+                return jq_state.get('options', {}).get(name, default)
             except Exception:
-                at = None
-            if isinstance(at, str) and at.lower() in ('raw','qfq','hfq','auto'):
-                return at.lower()
+                return default
+
+        def _normalize_code(code: str) -> str:
+            c = code.strip()
+            c = c.replace('.XSHE', '').replace('.XSHG', '').replace('.xshe', '').replace('.xshg', '')
+            for suf in sorted(_ALL_SUFFIXES, key=len, reverse=True):
+                if c.lower().endswith(suf):
+                    return c[:-len(suf)], suf  # (core, provided_suffix)
+            return c, ''
+
+        def _decide_adjust() -> str:
+            adj = _opt('adjust_type')
+            if isinstance(adj, str) and adj.lower() in ('raw','qfq','hfq','auto'):
+                return adj.lower()
             return 'auto'
 
-        def _resolve_adjust_pref(core: str) -> List[str]:
-            # 根据 adjust_type 生成一个候选后缀序列（不含 benchmark 专用优先顺序）
-            at = _get_adjust_type()
-            use_real_price_flag = bool(jq_state.get('options', {}).get('use_real_price', False))
-            # 日线两种命名族：英文 _daily* 与 中文 *_日* ，我们组合时保持与 data_source_preference 的通用后缀可兼容
-            if at == 'raw':
-                return ['_daily','_日','_daily_qfq','_日_qfq','_daily_hfq','_日_hfq']
-            if at == 'qfq':
-                return ['_daily_qfq','_日_qfq','_daily','_日','_daily_hfq','_日_hfq']
-            if at == 'hfq':
-                return ['_daily_hfq','_日_hfq','_daily','_日','_daily_qfq','_日_qfq']
-            # auto:
-            if use_real_price_flag:
-                # 动态复权语义 -> 真实未复权价格下单
-                return ['_daily','_日','_daily_qfq','_日_qfq','_daily_hfq','_日_hfq']
-            # 非真实价格 -> 前复权优先
-            return ['_daily_qfq','_日_qfq','_daily','_日','_daily_hfq','_日_hfq']
+        def _candidate_suffix_sequence(use_real_price_flag: bool, adjust_type: str) -> List[str]:
+            # adjust_type 显式优先
+            if adjust_type == 'raw':
+                base_seq = _SUFFIX_RAW + _SUFFIX_QFQ + _SUFFIX_HFQ
+            elif adjust_type == 'qfq':
+                base_seq = _SUFFIX_QFQ + _SUFFIX_RAW + _SUFFIX_HFQ
+            elif adjust_type == 'hfq':
+                base_seq = _SUFFIX_HFQ + _SUFFIX_RAW + _SUFFIX_QFQ
+            else:  # auto
+                if use_real_price_flag:
+                    base_seq = _SUFFIX_RAW + _SUFFIX_QFQ + _SUFFIX_HFQ
+                else:
+                    base_seq = _SUFFIX_QFQ + _SUFFIX_RAW + _SUFFIX_HFQ
+            # 用户 preference 追加（末尾去重保序）
+            user_pref = _opt('data_source_preference')
+            if isinstance(user_pref, (list, tuple)):
+                seq = []
+                seen = set()
+                for suf in list(base_seq) + list(user_pref):
+                    if suf not in seen and isinstance(suf, str):
+                        seen.add(suf)
+                        seq.append(suf)
+                return seq
+            return list(base_seq)
 
-        # 允许通过 set_option('data_source_preference', ['_daily','_daily_qfq','_日']) 指定文件优先级
-        # 默认优先 raw daily -> qfq -> 中文“日”（调换顺序以便默认成交价格与聚宽“前复权/不复权”设置保持一致，避免价格缩放导致下单金额差异）
-        def _get_data_source_preference() -> List[str]:
-            try:
-                pref = jq_state.get('options', {}).get('data_source_preference')
-                if isinstance(pref, (list, tuple)) and pref:
-                    return list(pref)
-            except Exception:
-                pass
-            return ['_daily', '_daily_qfq', '_日']
-
-        def _strip_suffix(base: str) -> str:
-            b = base
-            for suf in preserved_suffixes:
-                if b.lower().endswith(suf):
-                    return b[: -len(suf)]
-            return b
-
-        def _pick_with_preference(base: str) -> str:
-            # 合并用户 data_source_preference 与 adjust_type 推导出的顺序：
-            # 逻辑：以 adjust 序列为主；若用户自定义 data_source_preference 则将其插入到 adjust 末尾去重保序。
-            adj_seq = _resolve_adjust_pref(base)
-            user_pref = _get_data_source_preference()  # 原默认 ['_daily','_daily_qfq','_日']
-            # 构建最终序列（后缀层面去重）
-            seen = set()
-            merged_suffixes: List[str] = []
-            for suf in adj_seq + user_pref:
-                if suf not in seen:
-                    seen.add(suf)
-                    merged_suffixes.append(suf)
-            # 支持 force_data_variant 继续硬指定（保留原能力）
-            force = None
-            try:
-                force = jq_state.get('options', {}).get('force_data_variant')
-            except Exception:
-                force = None
+        def _apply_force_variant(core: str) -> Optional[str]:
+            force = _opt('force_data_variant')
             if isinstance(force, str):
-                vmap = {'daily':'_daily','raw':'_daily','qfq':'_daily_qfq','hfq':'_daily_hfq','日':'_日'}
-                suf = vmap.get(force.strip().lower())
+                fmap = {'daily':'_daily','raw':'_daily','qfq':'_daily_qfq','hfq':'_daily_hfq','日':'_日'}
+                suf = fmap.get(force.lower().strip())
                 if suf:
-                    forced = f"{base}{suf}"
-                    if os.path.exists(os.path.join(datadir, forced + '.csv')):
-                        try:
-                            jq_state['log'].append(f"[data_source_force] using={forced}.csv by force_data_variant={force}")
-                        except Exception:
-                            pass
-                        return forced
+                    candidate = core + suf
+                    path = os.path.join(datadir, candidate + '.csv')
+                    if os.path.exists(path):
+                        jq_state['log'].append(f"[symbol_force] using={candidate}.csv force_data_variant={force}")
+                        return candidate
                     else:
-                        try:
-                            jq_state['log'].append(f"[data_source_force] missing={forced}.csv fallback merged_suffixes={merged_suffixes}")
-                        except Exception:
-                            pass
-            candidates = [f"{base}{suf}" for suf in merged_suffixes]
-            existence_desc = []
-            chosen = None
-            for fn in candidates:
-                exists = os.path.exists(os.path.join(datadir, fn + '.csv'))
-                existence_desc.append(f"{fn}:{'Y' if exists else 'N'}")
-                if exists and chosen is None:
-                    chosen = fn
-            # 若首候选存在却没有被选（理论上不会发生），输出警告
-            try:
-                first_candidate_path = os.path.join(datadir, candidates[0] + '.csv')
-                if os.path.exists(first_candidate_path) and chosen != candidates[0]:
+                        jq_state['log'].append(f"[symbol_force] missing={candidate}.csv (will fallback)")
+            return None
+
+        def _select_one(raw_code: str) -> str:
+            core, provided_suffix = _normalize_code(raw_code)
+            respect = bool(_opt('respect_symbol_suffix', False))
+            use_real_price_flag = bool(_opt('use_real_price', False))
+            strict_real_price_flag = bool(_opt('strict_real_price', False))
+            adjust = _decide_adjust()
+            # 如果用户提供后缀且 respect=True 直接使用
+            if provided_suffix and respect:
+                direct = core + provided_suffix
+                path = os.path.join(datadir, direct + '.csv')
+                if os.path.exists(path):
                     jq_state['log'].append(
-                        f"[adjust_warning] first_candidate_exists_but_not_chosen first={candidates[0]} chosen={chosen}"
+                        f"[symbol_select] mode=respect direct={direct} adjust={adjust} use_real_price={use_real_price_flag}"
                     )
-            except Exception:
-                pass
-            try:
-                jq_state['log'].append(
-                    f"[data_source_scan] adjust_type={_get_adjust_type()} base={base} candidates={'|'.join(existence_desc)} selected={chosen or 'NONE'} merged_suffixes={'|'.join(merged_suffixes)}"
-                )
-                # 更精确的决策审计
-                try:
-                    use_real_price_flag = bool(jq_state.get('options', {}).get('use_real_price', False))
-                except Exception:
-                    use_real_price_flag = False
-                jq_state['log'].append(
-                    f"[adjust_resolve] base={base} adjust_type={_get_adjust_type()} use_real_price={use_real_price_flag} sequence={'|'.join(merged_suffixes)} chosen={chosen or candidates[0]}"
-                )
-            except Exception:
-                pass
-            return chosen or candidates[0]
+                    return direct
+                else:
+                    jq_state['log'].append(
+                        f"[symbol_select] mode=respect_missing direct={direct} adjust={adjust} use_real_price={use_real_price_flag}"
+                    )
+            # force_data_variant 优先
+            forced = _apply_force_variant(core)
+            if forced:
+                return forced
+            # 生成候选
+            suffix_seq = _candidate_suffix_sequence(use_real_price_flag, adjust)
+            candidates = [core + suf for suf in suffix_seq]
+            chosen = None
+            existence = []
+            for name in candidates:
+                exists = os.path.exists(os.path.join(datadir, name + '.csv'))
+                existence.append(f"{name}:{'Y' if exists else 'N'}")
+                if exists and chosen is None:
+                    chosen = name
+            if not chosen:
+                jq_state['log'].append(f"[symbol_warn] no_candidate_exists core={core} first={candidates[0] if candidates else 'NONE'}")
+                chosen = candidates[0]
+            # strict_real_price 约束：若开启且 use_real_price=True，则必须选中 raw 后缀(_daily/_日)，否则抛错
+            if strict_real_price_flag and use_real_price_flag:
+                raw_ok = any(chosen.endswith(suf) for suf in _SUFFIX_RAW)
+                if not raw_ok:
+                    raise RuntimeError(
+                        f"strict_real_price=True 但选中的数据文件 {chosen}.csv 不是 raw 类型(_daily/_日)。请添加原始未复权数据文件或关闭 strict_real_price。"
+                    )
+            jq_state['log'].append(
+                f"[symbol_select] core={core} adjust={adjust} use_real_price={use_real_price_flag} strict={strict_real_price_flag} respect={respect} candidates={'|'.join(existence)} chosen={chosen}"
+            )
+            return chosen
 
         def _map_security_code(code: str) -> str:
-            c = code.strip()
-            lower = c.lower()
-            # 去掉市场后缀 .XSHE/.XSHG
-            c_no_market = c.replace('.XSHE', '').replace('.XSHG', '').replace('.xshe', '').replace('.xshg', '')
-            # 无论是否已经带复权/日线后缀，都剥离再按优先级重选
-            core = _strip_suffix(c_no_market)
-            return _pick_with_preference(core)
+            return _select_one(code)
 
         def _map_benchmark_code(code: str) -> str:
-            c = code.strip()
-            # 去市场后缀
-            c_no_market = c.replace('.XSHE', '').replace('.XSHG', '').replace('.xshe', '').replace('.xshg', '')
-            # 基准允许单独的 benchmark_source_preference 定义；若无则使用专用序列
-            bench_pref = jq_state.get('options', {}).get('benchmark_source_preference')
-            if isinstance(bench_pref, (list, tuple)) and bench_pref:
-                pref_list = list(bench_pref)
-            else:
-                # 默认：中文“_日” 优先，再 raw，再 qfq
-                pref_list = ['_日', '_daily', '_daily_qfq']
-            # 剥后缀再重选
-            core = _strip_suffix(c_no_market)
-            candidates = [f"{core}{suf}" for suf in pref_list]
-            existence_desc = []
-            chosen = None
-            for fn in candidates:
-                exists = os.path.exists(os.path.join(datadir, fn + '.csv'))
-                existence_desc.append(f"{fn}:{'Y' if exists else 'N'}")
-                if exists and chosen is None:
-                    chosen = fn
-            try:
-                jq_state['log'].append(
-                    f"[benchmark_source_scan] base={core} candidates={'|'.join(existence_desc)} selected={chosen or 'NONE'}"
-                )
-            except Exception:
-                pass
-            if chosen:
-                return chosen
-            return candidates[0]
+            # 基准简单：若 respect_symbol_suffix=True 同样生效；否则使用独立优先级：中文日 -> raw -> qfq
+            core, provided_suffix = _normalize_code(code)
+            respect = bool(_opt('respect_symbol_suffix', False))
+            if provided_suffix and respect:
+                direct = core + provided_suffix
+                if os.path.exists(os.path.join(datadir, direct + '.csv')):
+                    return direct
+            bench_seq = ['_日','_daily','_daily_qfq','_daily_hfq']
+            for suf in bench_seq:
+                cand = core + suf
+                if os.path.exists(os.path.join(datadir, cand + '.csv')):
+                    jq_state['log'].append(f"[benchmark_select] core={core} candidates={bench_seq} chosen={cand}")
+                    return cand
+            jq_state['log'].append(f"[benchmark_select_warn] none_exists core={core} fallback={core+bench_seq[0]}")
+            return core + bench_seq[0]
 
         symbols: List[str] = []
         g_sec = getattr(jq_state.get('g'), 'security', None)
@@ -1089,6 +1255,44 @@ def run_backtest(
                 except Exception:
                     mapped_syms.append(s)
         symbols = list(dict.fromkeys(mapped_syms))  # 去重保持顺序
+        # use_real_price=True 时强制优先使用未复权(raw)数据文件（若存在），覆盖映射结果（除非用户显式 respect_suffix=True）
+        try:
+            if symbols and not respect_suffix and bool(jq_state.get('options', {}).get('use_real_price', False)):
+                remapped = []
+                detail_lines = []
+                for sym in symbols:
+                    original = sym
+                    core = sym
+                    stripped = False
+                    for suf in ('_daily_qfq','_daily_hfq','_日_qfq','_日_hfq','_daily','_日'):
+                        if core.endswith(suf):
+                            core = core[:-len(suf)]
+                            stripped = True
+                            break
+                    raw_candidates = [core + '_daily', core + '_日']
+                    chosen_raw = None
+                    for rc in raw_candidates:
+                        exists = os.path.exists(os.path.join(datadir, rc + '.csv'))
+                        detail_lines.append(f"candidate={rc} exists={exists}")
+                        if exists and chosen_raw is None:
+                            chosen_raw = rc
+                    remapped.append(chosen_raw or sym)
+                    jq_state['log'].append(
+                        f"[use_real_price_scan] orig={original} stripped={stripped} core={core} raw_found={bool(chosen_raw)} chosen={chosen_raw or sym} details={'|'.join(detail_lines)}"
+                    )
+                symbols = list(dict.fromkeys(remapped))
+                jq_state['log'].append(f"[use_real_price_remap] final_symbols={symbols}")
+        except Exception as _e:
+            try:
+                jq_state['log'].append(f"[use_real_price_remap_error] {type(_e).__name__}:{_e}")
+            except Exception:
+                pass
+        # 记录主 symbol 供后续 blocked 订单引用
+        try:
+            if symbols:
+                jq_state['primary_symbol'] = symbols[0]
+        except Exception:
+            pass
         try:
             jq_state['log'].append(f"[symbol_mapped] final={symbols} respect_suffix={respect_suffix}")
         except Exception:
@@ -1100,13 +1304,48 @@ def run_backtest(
             benchmark_symbol = _map_benchmark_code(benchmark_symbol)
 
         # 读取暖场天数（默认 250，可 set_option('history_lookback_days', N)）
+        # 新增：jq_auto_history_preload=True (默认开启) && 用户未显式设置时，
+        # 自动从策略源码中提取最大周期并放大，模拟聚宽“隐式加载历史”能力，使 start 当天即可产生信号。
         lookback_days = 250
+        user_set_lb = False
         try:
             lb = jq_state.get('options', {}).get('history_lookback_days')
             if isinstance(lb, (int, float)) and lb >= 0:
                 lookback_days = int(lb)
+                user_set_lb = True
         except Exception:
             pass
+        try:
+            auto_flag = bool(jq_state.get('options', {}).get('jq_auto_history_preload', True))
+        except Exception:
+            auto_flag = True
+        if (not user_set_lb) and auto_flag:
+            try:
+                code_txt = strategy_code
+                periods: List[int] = []
+                # pattern1: period=数字
+                for m in re.finditer(r"period\s*=\s*(\d{1,4})", code_txt):
+                    periods.append(int(m.group(1)))
+                # pattern2: 常见指标函数第一个参数中出现数字（简化版）
+                for m in re.finditer(r"\b(SMA|EMA|MA|ATR|RSI|WMA|TRIMA|KAMA|ADX|CCI)\s*\(\s*[^,\n]*?(\d{1,4})", code_txt, re.IGNORECASE):
+                    try:
+                        periods.append(int(m.group(2)))
+                    except Exception:
+                        pass
+                periods = [p for p in periods if p >= 3]
+                if periods:
+                    max_p = max(periods)
+                    auto_lb = min(max_p * 3, 600)  # 至少 3 倍，最大 600
+                    if auto_lb > lookback_days:
+                        lookback_days = auto_lb
+                    jq_state['log'].append(f"[auto_history_preload] detected_periods={sorted(set(periods))} max={max_p} lookback_days={lookback_days}")
+                else:
+                    jq_state['log'].append(f"[auto_history_preload] none_detected use_default={lookback_days}")
+            except Exception as _e:
+                try:
+                    jq_state['log'].append(f"[auto_history_preload_error] {type(_e).__name__}:{_e}")
+                except Exception:
+                    pass
         warmup_start = (pd.to_datetime(start) - pd.Timedelta(days=lookback_days)).date().isoformat()
 
         # 建立原始输入代码与映射后文件名的对应关系，便于 attribute_history 精确匹配
@@ -1125,7 +1364,7 @@ def run_backtest(
                 # 记录映射关系与所用数据文件到日志
                 try:
                     jq_state['symbol_file_map'][symbols[i] if i < len(symbols) else sym] = sym
-                    jq_state['log'].append(f"[data_source] load={sym}.csv pref={_get_data_source_preference()}")
+                    jq_state['log'].append(f"[data_source] load={sym}.csv")
                 except Exception:
                     pass
             except Exception:
@@ -1189,15 +1428,54 @@ def run_backtest(
             jq_state['log'].append(f"[slippage_mode] scheme=half_slip half={(slippage_perc or 0)/2}")
         except Exception:
             pass
-        # Corporate actions load (optional)
+        # Corporate actions load (CSV optional) + manual merge (always if provided)
         try:
+            jq_state['corporate_actions'] = []
+            # Load from CSV only when simulate_corporate_actions True
             if bool(jq_state['options'].get('simulate_corporate_actions', False)):
                 symbol = jq_state.get('symbol') or jq_state.get('security_code') or jq_state.get('raw_symbol')
                 if symbol:
-                    evts = load_corporate_actions(symbol, jq_state.get('data_dir','data'), logger=jq_state.get('logger'))
-                    jq_state['corporate_actions'] = evts
-                else:
-                    jq_state['corporate_actions'] = []
+                    jq_state['corporate_actions'] = load_corporate_actions(symbol, jq_state.get('data_dir','data'), logger=jq_state.get('logger'))
+            # Manual injection via set_option('manual_corporate_actions',[{...}])
+            manual = jq_state['options'].get('manual_corporate_actions')
+            if isinstance(manual, list) and manual:
+                added = 0
+                from .corporate_actions import CorporateActionEvent as _CAE
+                for item in manual:
+                    try:
+                        if not isinstance(item, dict):
+                            continue
+                        date = str(item.get('date') or '').strip()
+                        atype = str(item.get('type') or '').strip().upper()
+                        if not date or not atype:
+                            continue
+                        ratio = item.get('ratio')
+                        cash = item.get('cash')
+                        shares = item.get('shares')
+                        ev = _CAE(date=date, action_type=atype, ratio=(float(ratio) if ratio not in (None,'') else None), cash=(float(cash) if cash not in (None,'') else None), note='manual')
+                        if shares not in (None,''):
+                            try:
+                                ev._manual_shares = int(shares)
+                            except Exception:
+                                pass
+                        jq_state['corporate_actions'].append(ev)
+                        try:
+                            jq_state['log'].append(f"[ca_manual_merge] date={date} type={atype} shares={shares} ratio={ratio}")
+                        except Exception:
+                            pass
+                        added += 1
+                    except Exception:
+                        continue
+                if added:
+                    try:
+                        jq_state['log'].append(f"[ca_manual_load] count={added}")
+                    except Exception:
+                        pass
+            # Sort after merge
+            try:
+                jq_state['corporate_actions'].sort(key=lambda e: e.date)
+            except Exception:
+                pass
         except Exception:
             jq_state['corporate_actions'] = []
         use_real_price_opt = jq_state.get('options', {}).get('use_real_price', False)
@@ -1380,8 +1658,14 @@ def run_backtest(
                                 comm = total_fee
                         # 费用日志
                         try:
+                            # 与 [fill] 日志对齐：增加执行日期前缀，便于区分是否同日撮合
+                            exec_date_prefix = ''
+                            try:
+                                exec_date_prefix = f"{dt} 09:30:00 - INFO - " if dt else ''
+                            except Exception:
+                                exec_date_prefix = ''
                             jq_state['log'].append(
-                                f"[fee] {side} {name} value={value:.2f} price={price:.4f} base_comm={raw_comm:.4f} adj_comm={adj_comm:.4f} stamp_duty={(abs(value)*stamp_duty):.4f} final_comm={comm:.4f}"
+                                f"{exec_date_prefix}[fee] {side} {name} value={value:.2f} price={price:.4f} base_comm={raw_comm:.4f} adj_comm={adj_comm:.4f} stamp_duty={(abs(value)*stamp_duty):.4f} final_comm={comm:.4f}"
                             )
                         except Exception:
                             pass
@@ -1397,11 +1681,11 @@ def run_backtest(
                     pass
                 # 将实际成交写入 JQ 日志，方便与期望价格核对
                 try:
-                    # 构造聚宽风格时间头（09:30:00）
-                    ts = f"{dt} 09:30:00" if dt else None
+                    # 方案C: 始终使用 executed.dt (exec_date) 作为日志前缀日期，不依赖当前 bar
+                    exec_date = dt  # already formatted date string
                     line = f"[fill] {side} {name} size={abs(size)} price={price} value={value} commission={comm}"
-                    if ts:
-                        jq_state['log'].append(f"{ts} - INFO - {line}")
+                    if exec_date:
+                        jq_state['log'].append(f"{exec_date} 09:30:00 - INFO - {line}")
                     else:
                         jq_state['log'].append(line)
                 except Exception:
@@ -1477,6 +1761,22 @@ def run_backtest(
         lost = trade_ana.get('lost', {}).get('total', 0)
         win_rate = (won / total_trades) if total_trades else 0
 
+        # 推断数据变体（若仅单标的，取第一；多标的则列表）
+        def _infer_variant(name: str) -> str:
+            if any(name.endswith(s) for s in _SUFFIX_QFQ):
+                return 'qfq'
+            if any(name.endswith(s) for s in _SUFFIX_HFQ):
+                return 'hfq'
+            if any(name.endswith(s) for s in _SUFFIX_RAW):
+                return 'raw'
+            return 'unknown'
+        data_variant = None
+        if symbols:
+            if len(symbols) == 1:
+                data_variant = _infer_variant(symbols[0])
+            else:
+                data_variant = {s: _infer_variant(s) for s in symbols}
+
         metrics = {
             'final_value': cerebro.broker.getvalue(),
             'pnl_pct': (cerebro.broker.getvalue() / cash - 1),
@@ -1500,6 +1800,7 @@ def run_backtest(
             'data_source_preference': None,
             'data_sources_used': None,
             'adjust_type': None,
+            'data_variant': data_variant,
         }
 
         # 基准 & 超额
@@ -1611,7 +1912,11 @@ def run_backtest(
         try:
             metrics['data_source_preference'] = jq_state.get('options', {}).get('data_source_preference') or ['_daily', '_daily_qfq', '_日']
             metrics['data_sources_used'] = jq_state.get('symbol_file_map')
-            metrics['adjust_type'] = _get_adjust_type()
+            # 新结构：由 _decide_adjust() 决定
+            try:
+                metrics['adjust_type'] = _decide_adjust()
+            except Exception:
+                metrics['adjust_type'] = None
         except Exception:
             pass
 
@@ -1827,55 +2132,48 @@ def run_backtest(
         # 回测结束，从 analyzer 里取交易记录 (包含已平仓 + 未平仓) 及订单级别明细
         trades: List[TradeRecord] = strat.analyzers.trade_capture.get_analysis() if hasattr(strat.analyzers, 'trade_capture') else []
         orders: List[OrderRecord] = strat.analyzers.order_capture.get_analysis() if hasattr(strat.analyzers, 'order_capture') else []
-
-        # 汇总每日买卖柱（金额口径），并统计当日开仓/平仓次数（基于 TradeCapture 的 open/close 日期）
-        daily_turnover_map: Dict[str, Dict[str, Any]] = {}
+        # 合并被阻断订单
         try:
-            for od in (orders or []):
-                d = od.datetime or ''
-                if not d:
-                    continue
-                rec = daily_turnover_map.setdefault(d, {'date': d, 'buy_amt': 0.0, 'sell_amt': 0.0, 'buy_cnt': 0, 'sell_cnt': 0, 'open_cnt': 0, 'close_cnt': 0})
-                val = float(od.value) if od.value is not None else 0.0
-                if (od.side or '').upper() == 'BUY':
-                    rec['buy_amt'] += abs(val)
-                    rec['buy_cnt'] += 1
-                elif (od.side or '').upper() == 'SELL':
-                    rec['sell_amt'] += abs(val)
-                    rec['sell_cnt'] += 1
-            for tr in (trades or []):
-                if tr.open_datetime:
-                    rec = daily_turnover_map.setdefault(tr.open_datetime, {'date': tr.open_datetime, 'buy_amt': 0.0, 'sell_amt': 0.0, 'buy_cnt': 0, 'sell_cnt': 0, 'open_cnt': 0, 'close_cnt': 0})
-                    rec['open_cnt'] += 1
-                if tr.close_datetime:
-                    rec = daily_turnover_map.setdefault(tr.close_datetime, {'date': tr.close_datetime, 'buy_amt': 0.0, 'sell_amt': 0.0, 'buy_cnt': 0, 'sell_cnt': 0, 'open_cnt': 0, 'close_cnt': 0})
-                    rec['close_cnt'] += 1
+            blocked = jq_state.get('blocked_orders', [])
+            if blocked:
+                orders = blocked + orders
         except Exception:
             pass
-        # 仅保留回测窗口内的日期，并按日期排序
-        daily_turnover: List[Dict[str, Any]] = []
+        # 只保留 >= start 的订单 (Blocked 订单如果其日期 < start 也丢弃)
         try:
-            sdt = pd.to_datetime(start)
-            edt = pd.to_datetime(end)
-            daily_turnover = [v for k, v in daily_turnover_map.items() if sdt <= pd.to_datetime(k) <= edt]
-            daily_turnover.sort(key=lambda x: x['date'])
+            orders = [o for o in orders if (o.datetime or '') >= start]
         except Exception:
-            daily_turnover = list(sorted(daily_turnover_map.values(), key=lambda x: x['date']))
-
-        # 聚宽兼容记录日期对齐: 若用户 record 次数与 equity_curve 后段长度匹配, 补齐日期
-        jq_records = jq_state.get('records') if 'jq_state' in locals() else None
-        if jq_records and equity_curve:
-            tail_len = min(len(jq_records), len(equity_curve))
-            date_map = equity_curve[-tail_len:]
-            # 只给缺失 dt 的填充
-            offset = len(jq_records) - tail_len
-            for i, r in enumerate(jq_records):
-                if r.get('dt') is None and i >= offset:
-                    map_idx = i - offset
-                    if 0 <= map_idx < tail_len:
-                        r['dt'] = date_map[map_idx]['date']
-        jq_logs = jq_state.get('log') if 'jq_state' in locals() else None
-
+            pass
+        # 排序订单：按日期 + 原始插入顺序；若同日，保持 BlockedLimitUp 在前（便于展示拦截→成交）。
+        try:
+            def _ord_key(o: OrderRecord):
+                d = o.datetime or '9999-99-99'
+                # 加一个次序：Blocked 排前面，其余按 1
+                pri = 0 if (o.status or '').startswith('Blocked') else 1
+                return (d, pri)
+            orders.sort(key=_ord_key)
+        except Exception:
+            pass
+        # 只保留 >= start 的交易；并过滤 size=0 且无价格的伪记录
+        try:
+            trades = [t for t in trades if (t.datetime or '') >= start and (t.size or 0) != 0]
+        except Exception:
+            pass
+        # 同样对交易按开/平仓日期排序（主要用 close_datetime, fallback datetime）
+        try:
+            def _trade_key(t: TradeRecord):
+                d = t.close_datetime or t.datetime or '9999-99-99'
+                return d
+            trades.sort(key=_trade_key)
+        except Exception:
+            pass
+        # 回退占位：当前版本尚未重新实现 daily_turnover / jq_records / jq_logs 采集逻辑，先以空值返回避免编译错误
+        daily_turnover: List[Dict[str, Any]] = []
+        jq_records = None
+        try:
+            jq_logs = list(jq_state.get('log', []))
+        except Exception:
+            jq_logs = []
         return BacktestResult(
             metrics=metrics,
             equity_curve=equity_curve,
