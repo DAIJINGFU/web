@@ -1,6 +1,7 @@
 import io
 import json
 import traceback
+import math as _math
 import re
 import types
 import os
@@ -9,6 +10,7 @@ from typing import Dict, Any, List, Optional, Callable
 
 import backtrader as bt
 import pandas as pd
+from .corporate_actions import load_corporate_actions, apply_event
 
 # -----------------------------
 # 数据加载器 (简化版本)
@@ -325,6 +327,11 @@ def compile_user_strategy(code: str):
                     portfolio = _Portfolio()
 
                 self._jq_context = _Context()
+                # 绑定执行环境引用，供 _run_handle / next_open / next 使用
+                try:
+                    self._exec_env = globals().get('exec_env') or exec_env  # fallback
+                except Exception:
+                    self._exec_env = {'jq_state': jq_state}
                 # 运行 initialize
                 init_func(self._jq_context)
 
@@ -334,6 +341,32 @@ def compile_user_strategy(code: str):
 
             def _run_handle(self):
                 # 提供 attribute_history, order_value, order_target 实现
+                # 先获取 exec_env/jq_state 以便后续 CA 应用
+                exec_env = getattr(self, '_exec_env', None)
+                if exec_env is None:
+                    exec_env = {}
+                jq_state = exec_env.get('jq_state', {}) if isinstance(exec_env, dict) else {}
+                # --- Corporate Actions (simulate_corporate_actions) ---
+                try:
+                    if jq_state.get('corporate_actions'):
+                        cur_dt = bt.num2date(self.data.datetime[0]).date().isoformat()
+                        # 找出当天所有事件
+                        todays = [e for e in jq_state['corporate_actions'] if e.date == cur_dt]
+                        if todays:
+                            logger = jq_state.get('logger')
+                            for ev in todays:
+                                from .corporate_actions import apply_event as _apply_ca
+                                res = _apply_ca(ev, self.position, self.broker, logger=logger)
+                                if res and isinstance(res, tuple):
+                                    tag, payload = res
+                                    if tag in ('BONUS_SHARES','SPLIT_ADJ') and isinstance(payload, int) and payload != 0:
+                                        if payload > 0:
+                                            self.buy(size=payload)
+                                        else:
+                                            self.sell(size=abs(payload))
+                except Exception:
+                    pass
+                # 继续原有逻辑
                 def attribute_history(security: str, n: int, unit: str, fields: List[str]):
                     # 支持 unit 为 '1d' 或 '1D' 或 'day'
                     if unit.lower() not in ('1d', 'day', 'd'):
@@ -463,11 +496,22 @@ def compile_user_strategy(code: str):
                         down_lim_fac = float(jqst['options'].get('limit_down_factor', 0.90))
                         fill_price = str(jqst['options'].get('fill_price', 'open')).lower()
                         if fill_price == 'close':
-                            price = float(getattr(self.data, 'close')[0])
+                            base_price = float(getattr(self.data, 'close')[0])
                         else:
-                            price = float(getattr(self.data, 'open')[0]) if hasattr(self.data, 'open') else float(getattr(self.data, 'close')[0])
-                        if price <= 0:
+                            base_price = float(getattr(self.data, 'open')[0]) if hasattr(self.data, 'open') else float(getattr(self.data, 'close')[0])
+                        if base_price <= 0:
                             return
+                        slip_perc = float(jqst['options'].get('slippage_perc', 0.0) or 0.0)
+                        # 方案2 半滑点：内部执行价 = base_price*(1±slip/2) 后买向下截断 / 卖向上进位到分
+                        half = slip_perc / 2.0
+                        # use module-level _math
+                        def _round_buy(p: float) -> float:
+                            return _math.floor(p * 100) / 100.0
+                        def _round_sell(p: float) -> float:
+                            return _math.ceil(p * 100) / 100.0
+                        price = base_price
+                        buy_eff_price = _round_buy(base_price * (1 + half))
+                        sell_eff_price = _round_sell(base_price * (1 - half))
                         # 涨跌停判定（简单：比较上一交易日收盘）
                         if enable_limit:
                             try:
@@ -508,15 +552,16 @@ def compile_user_strategy(code: str):
                                 if amount <= 0 or price <= 0:
                                     return 0
                                 # 初步估算 (忽略最小佣金)
-                                guess = int(amount / (price * (1 + max(rate, 0))))
+                                eff_p = buy_eff_price  # 估算用含滑点价
+                                guess = int(amount / (eff_p * (1 + max(rate, 0))))
                                 if guess < 0:
                                     guess = 0
                                 # lot 对齐
                                 guess = (guess // lot) * lot
                                 # 回退调整，确保费用后不超额
                                 while guess > 0:
-                                    comm = max(min_commission, guess * price * rate)
-                                    gross = guess * price + comm  # 买入不含印花税
+                                    comm = max(min_commission, guess * eff_p * rate)
+                                    gross = guess * eff_p + comm  # 买入不含印花税
                                     if gross <= amount + 1e-9:  # 容差
                                         return guess
                                     guess -= lot
@@ -527,8 +572,8 @@ def compile_user_strategy(code: str):
                                 cur = shares
                                 while True:
                                     nxt = cur + lot
-                                    comm_n = max(min_commission, nxt * price * rate)
-                                    gross_n = nxt * price + comm_n
+                                    comm_n = max(min_commission, nxt * buy_eff_price * rate)
+                                    gross_n = nxt * buy_eff_price + comm_n
                                     if gross_n <= target_amt + 1e-9 and gross_n <= broker_cash + 1e-9:
                                         cur = nxt
                                         continue
@@ -537,11 +582,11 @@ def compile_user_strategy(code: str):
                             if shares <= 0:
                                 exec_env['log'].info(f"[order_value_calc] side=BUY insufficient target_amt={target_amt:.2f} cash={broker_cash:.2f}")
                                 return
-                            comm_final = max(min_commission, shares * price * rate)
-                            gross_final = shares * price + comm_final
+                            comm_final = max(min_commission, shares * buy_eff_price * rate)
+                            gross_final = shares * buy_eff_price + comm_final
                             leftover = broker_cash - gross_final
                             exec_env['log'].info(
-                                f"[order_value_calc] side=BUY strict={strict} price={price:.4f} target={abs(value):.2f} cash={broker_cash:.2f} shares={shares} gross={shares*price:.2f} comm={comm_final:.2f} leftover={leftover:.2f} lot={lot}"
+                                f"[order_value_calc] side=BUY strict={strict} base_price={base_price:.4f} exec_price={buy_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} target={abs(value):.2f} cash={broker_cash:.2f} shares={shares} gross={shares*buy_eff_price:.2f} comm={comm_final:.2f} leftover={leftover:.2f} lot={lot} rule=floor"
                             )
                             if shares > 0:
                                 self.buy(size=shares)
@@ -556,14 +601,15 @@ def compile_user_strategy(code: str):
                             return
                         # shares 估算：卖出所得 = shares*price - commission - stamp_duty*shares*price >= target_amt? 但聚宽 order_value(value<0) 更像按“成交额”近似；
                         # 我们按“想减仓的市值”来反推 shares，使 shares*price ≈ target_amt，不超出持仓。
-                        shares = int(target_amt / price)
+                        eff_p_sell = sell_eff_price
+                        shares = int(target_amt / eff_p_sell)
                         shares = min(shares, pos_size)
                         shares = (shares // lot) * lot
                         if shares <= 0:
                             return
                         # 重新估算若加入费用是否明显偏离；若偏离太多且仍可再卖出一个 lot 则调整
                         def _sell_net(sh):
-                            gross = sh * price
+                            gross = sh * eff_p_sell
                             comm = max(min_commission, gross * rate)
                             tax = gross * stamp_duty_rate
                             return gross - comm - tax, gross, comm, tax
@@ -575,7 +621,7 @@ def compile_user_strategy(code: str):
                                 shares += lot
                                 net, gross, comm, tax = net2, gross2, comm2, tax2
                         exec_env['log'].info(
-                            f"[order_value_calc] side=SELL strict={strict} price={price:.4f} target={abs(value):.2f} pos_val={pos_size*price:.2f} shares={shares} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} lot={lot}" )
+                            f"[order_value_calc] side=SELL strict={strict} base_price={base_price:.4f} exec_price={eff_p_sell:.4f} slip={slip_perc:.5f} half={half:.5f} target={abs(value):.2f} pos_val={pos_size*base_price:.2f} shares={shares} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} lot={lot} rule=ceil" )
                         if shares > 0:
                             self.sell(size=shares)
                     except Exception as _e:
@@ -601,11 +647,21 @@ def compile_user_strategy(code: str):
                         down_lim_fac = float(jqst['options'].get('limit_down_factor', 0.90))
                         fill_price = str(jqst['options'].get('fill_price', 'open')).lower()
                         if fill_price == 'close':
-                            price = float(getattr(self.data, 'close')[0])
+                            base_price = float(getattr(self.data, 'close')[0])
                         else:
-                            price = float(getattr(self.data, 'open')[0]) if hasattr(self.data, 'open') else float(getattr(self.data, 'close')[0])
-                        if price <= 0:
+                            base_price = float(getattr(self.data, 'open')[0]) if hasattr(self.data, 'open') else float(getattr(self.data, 'close')[0])
+                        if base_price <= 0:
                             return
+                        slip_perc = float(jqst['options'].get('slippage_perc', 0.0) or 0.0)
+                        half = slip_perc / 2.0
+                        # use module-level _math
+                        def _round_buy(p: float) -> float:
+                            return _math.floor(p * 100) / 100.0
+                        def _round_sell(p: float) -> float:
+                            return _math.ceil(p * 100) / 100.0
+                        buy_eff_price = _round_buy(base_price * (1 + half))
+                        sell_eff_price = _round_sell(base_price * (1 - half))
+                        price = base_price
                         # limit check
                         if enable_limit:
                             try:
@@ -632,8 +688,8 @@ def compile_user_strategy(code: str):
                         if delta > 0:
                             # 估算最大可买 shares (复用 order_value BUY 逻辑思路)
                             def _max_buy(sh):
-                                comm = max(min_commission, sh * price * rate)
-                                return sh * price + comm
+                                comm = max(min_commission, sh * buy_eff_price * rate)
+                                return sh * buy_eff_price + comm
                             buy_sh = delta
                             if strict:
                                 # 若现金不足则向下回退
@@ -642,12 +698,12 @@ def compile_user_strategy(code: str):
                             else:
                                 if _max_buy(buy_sh) > broker_cash + 1e-9:
                                     # 简单回退一次
-                                    buy_sh = (int(broker_cash / price) // lot) * lot
+                                    buy_sh = (int(broker_cash / buy_eff_price) // lot) * lot
                             if buy_sh <= 0:
                                 exec_env['log'].info(f"[order_target_calc] side=BUY BLOCK delta={delta} cash={broker_cash:.2f}")
                                 return
-                            comm_f = max(min_commission, buy_sh * price * rate)
-                            exec_env['log'].info(f"[order_target_calc] side=BUY strict={strict} price={price:.4f} cur={cur} tgt={tgt} delta={delta} exec_shares={buy_sh} gross={buy_sh*price:.2f} comm={comm_f:.2f} cash={broker_cash:.2f}")
+                            comm_f = max(min_commission, buy_sh * buy_eff_price * rate)
+                            exec_env['log'].info(f"[order_target_calc] side=BUY strict={strict} base_price={base_price:.4f} exec_price={buy_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} cur={cur} tgt={tgt} delta={delta} exec_shares={buy_sh} gross={buy_sh*buy_eff_price:.2f} comm={comm_f:.2f} cash={broker_cash:.2f} rule=floor")
                             self.buy(size=buy_sh)
                             return
                         # SELL 减持
@@ -658,15 +714,15 @@ def compile_user_strategy(code: str):
                             return
                         # 严格模式：平仓时可以直接 close() 以减少潜在费用重复；否则按 size 卖
                         if tgt == 0 and self.position:
-                            exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} price={price:.4f} cur={cur} tgt=0 close_all size={cur}")
+                            exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} base_price={base_price:.4f} exec_price={sell_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} cur={cur} tgt=0 close_all size={cur} rule=ceil")
                             self.close()
                             return
                         # 估算费用
-                        gross = sell_sh * price
+                        gross = sell_sh * sell_eff_price
                         comm = max(min_commission, gross * rate)
                         tax = gross * stamp_duty_rate
                         net = gross - comm - tax
-                        exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} price={price:.4f} cur={cur} tgt={tgt} delta={delta} exec_shares={sell_sh} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f}")
+                        exec_env['log'].info(f"[order_target_calc] side=SELL strict={strict} base_price={base_price:.4f} exec_price={sell_eff_price:.4f} slip={slip_perc:.5f} half={half:.5f} cur={cur} tgt={tgt} delta={delta} exec_shares={sell_sh} gross={gross:.2f} comm={comm:.2f} stamp={tax:.2f} net={net:.2f} rule=ceil")
                         self.sell(size=sell_sh)
                     except Exception as _e:
                         try:
@@ -1120,19 +1176,30 @@ def run_backtest(
         except Exception:
             pass
         slippage_perc = jq_state.get('options', {}).get('slippage_perc')
-        # 若用户既未调用 set_slippage 也未 set_option(slippage_perc)，默认 PriceRelatedSlippage(0.00246)
+        # 方案2：内部半滑点（不再调用 broker.set_slippage_perc），默认仍用 0.00246 与聚宽对齐
         if slippage_perc is None and 'fixed_slippage' not in jq_state.get('options', {}):
+            slippage_perc = 0.00246
+            jq_state['options']['slippage_perc'] = slippage_perc
             try:
-                slippage_perc = 0.00246
-                jq_state['options']['slippage_perc'] = slippage_perc
-                jq_state['log'].append(f"[slippage_default] PriceRelatedSlippage perc={slippage_perc}")
-            except Exception:
-                slippage_perc = None
-        if slippage_perc is not None:
-            try:
-                cerebro.broker.set_slippage_perc(perc=slippage_perc)
+                jq_state['log'].append(f"[slippage_default] perc={slippage_perc}")
             except Exception:
                 pass
+        # 记录当前滑点模式（half_slip）便于审计
+        try:
+            jq_state['log'].append(f"[slippage_mode] scheme=half_slip half={(slippage_perc or 0)/2}")
+        except Exception:
+            pass
+        # Corporate actions load (optional)
+        try:
+            if bool(jq_state['options'].get('simulate_corporate_actions', False)):
+                symbol = jq_state.get('symbol') or jq_state.get('security_code') or jq_state.get('raw_symbol')
+                if symbol:
+                    evts = load_corporate_actions(symbol, jq_state.get('data_dir','data'), logger=jq_state.get('logger'))
+                    jq_state['corporate_actions'] = evts
+                else:
+                    jq_state['corporate_actions'] = []
+        except Exception:
+            jq_state['corporate_actions'] = []
         use_real_price_opt = jq_state.get('options', {}).get('use_real_price', False)
         # 成交价格控制：fill_price=open/close（默认 open）。
         fill_price_opt = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
@@ -1286,7 +1353,14 @@ def run_backtest(
                     rate = float(fee_cfg.get('rate', 0.0))
                     min_comm = float(fee_cfg.get('min_commission', 0.0))
                     stamp_duty = float(fee_cfg.get('stamp_duty', 0.0)) if side == 'SELL' else 0.0
-                    if value is not None:
+                    # Margin 且零股数：不收取任何佣金，做一个明确日志
+                    if order.status == order.Margin and abs(size) < 1e-9:
+                        comm = 0.0
+                        try:
+                            jq_state['log'].append(f"[order_margin] status=Margin size=0 skip_fee orig_comm={getattr(order.executed,'comm',0.0):.4f}")
+                        except Exception:
+                            pass
+                    elif value is not None:
                         gross = abs(value)
                         raw_comm = gross * rate
                         # Backtrader 已经按照 rate 计算过 comm（近似 raw_comm），我们做调整：
@@ -1543,7 +1617,7 @@ def run_backtest(
 
         # 重新计算并覆盖夏普；计算 α/β（CAPM，默认 Rf=3% 年化，可通过 set_option('risk_free_rate') 年化设定）
         try:
-            import math as _math
+            # use module-level _math
             # 交易日年化因子（聚宽口径常用 250，可通过 set_option('annualization_factor' 或 'trading_days') 配置）
             trading_days = 250.0
             try:
