@@ -144,6 +144,12 @@ ALLOWED_GLOBALS = {
         'float': float,
         'int': int,
         'str': str,
+        'list': list,
+        'tuple': tuple,
+        'dict': dict,
+        'set': set,
+        'bool': bool,
+        'isinstance': isinstance,
         'print': print,
     },
     'bt': bt,
@@ -187,6 +193,7 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
             'limit_up_factor': 1.10,
             'limit_down_factor': 0.90,
             'price_tick': 0.01,
+            'limit_pct': 0.10,
         },
         'records': [],
         'log': [],
@@ -198,7 +205,26 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         'user_start': None,      # 用户选择的开始日期（YYYY-MM-DD）
         'in_warmup': False,      # 暖场阶段（< user_start）
         'blocked_orders': [],  # 收集被涨跌停或规则阻断的订单（size=0）
+        'trading_calendar': None,
     }
+
+    # 交易日历加载 (可选)
+    try:
+        import os as _os, pandas as _pd
+        cal_path = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), 'data', 'trading_calendar.csv')
+        cal_path = _os.path.abspath(cal_path)
+        if _os.path.exists(cal_path):
+            _cal_df = _pd.read_csv(cal_path)
+            if 'date' in _cal_df.columns:
+                col = 'date'
+            else:
+                col = _cal_df.columns[0]
+            dates = set(_pd.to_datetime(_cal_df[col]).dt.date.astype(str))
+            if dates:
+                jq_state['trading_calendar'] = dates
+                jq_state['log'].append(f"[trading_calendar_loaded] size={len(dates)}")
+    except Exception:
+        pass
 
     class _Log:
         def info(self, msg):
@@ -365,69 +391,434 @@ def compile_user_strategy(code: str):
                 jq_state = exec_env.get('jq_state', {}) if isinstance(exec_env, dict) else {}
                 # 注入 get_price (简化版) 若未提供
                 if isinstance(exec_env, dict) and 'get_price' not in exec_env:
-                    def get_price(security: str,
-                                  count: int = 1,
-                                  end_date: str | None = None,
+                    def get_price(security,
+                                  start_date=None,
+                                  end_date=None,
                                   frequency: str = 'daily',
-                                  fields=None):
-                        """简化版聚宽 get_price：仅支持 daily & 单标的。
-                        security: 证券代码(忽略后缀)
-                        count: 取最近 count 条（不含当前正在运行的当日 bar）
-                        end_date: 忽略或与当前回测日不同则仍以当前回测日为结束(前一日)
-                        fields: None/单字段/字段列表；默认返回 ['open','close','high','low','volume']。
-                        返回 pandas.DataFrame 或 Series（当 fields 为单字段时）。
+                                  fields=None,
+                                  count=None,
+                                  skip_paused: bool = False,
+                                  fq: str = 'pre',
+                                  panel: bool = False,
+                                  fill_paused: bool = True):
+                        """JoinQuant 风格 get_price（本地近似实现）
+                        受限说明：
+                        - 仅支持 frequency='daily'（分钟级暂未实现会抛异常）
+                        - 不访问真实停牌日历；skip_paused/fill_paused 仅基于 volume==0 做近似
+                        - fq: 'pre'|'post'|'none' 占位，当前数据假定已是所需复权口径（由外部文件选择决定），因此不做额外价格复权变换
+                        - panel=True 时返回一个 PanelEmu 对象： panel['open'] -> DataFrame(index=日期, columns=证券)
+                        参数组合规则（仿聚宽）：
+                        1) (count, end_date) 或 (start_date, end_date) 二选一模式；不能同时指定 count 与 start_date
+                        2) 若均未给 end_date，则默认使用当前回测日的前一交易日作为 end_date
+                        3) count 模式：返回 end_date 之前（含 end_date）回溯 count 条
+                        4) start/end 模式：返回区间 [start_date, end_date]（含端点）
+                        返回：
+                          - 单一证券: DataFrame(index=date, columns=fields)；若 fields 为单字段字符串则返回 Series
+                          - 多证券 & panel=False: dict{sec -> DataFrame}
+                          - 多证券 & panel=True: PanelEmu (panel['open'] -> DataFrame)
                         """
+                        import datetime as _dt
                         import pandas as _pd
-                        if frequency != 'daily':
-                            raise ValueError('get_price 简化实现仅支持 daily')
-                        if count <= 0:
-                            return _pd.DataFrame()
-                        base = str(security).split('.')[0]
-                        hist_map = jq_state.get('history_df_map') or {}
-                        df_full = None
-                        if base in hist_map:
-                            df_full = hist_map[base]
+                        # 参数预处理 -------------------------------------------------
+                        if frequency.lower() not in ('daily', 'd'):
+                            raise ValueError('当前本地实现仅支持 frequency="daily"')
+                        # 统一证券列表
+                        if isinstance(security, (list, tuple, set)):
+                            secs = list(security)
                         else:
-                            for k, v in hist_map.items():
-                                if str(k).startswith(base):
-                                    df_full = v
-                                    break
-                        if df_full is None:
-                            df_full = jq_state.get('history_df')  # 可能是单一标的 DataFrame
-                        # 需要 datetime 列
-                        if df_full is None or 'datetime' not in df_full.columns:
-                            return _pd.DataFrame()
-                        # 当前模拟日
-                        try:
-                            cur_date = bt.num2date(self.data.datetime[0]).date()
-                        except Exception:
-                            cur_date = None
-                        work = df_full
-                        if cur_date is not None:
-                            work = work[work['datetime'].dt.date < cur_date]
-                        if work.empty:
-                            return _pd.DataFrame()
-                        tail = work.tail(count)
-                        default_fields = ['open','close','high','low','volume']
+                            secs = [security]
+                        # 默认字段
+                        all_possible_fields = ['open','close','high','low','volume','money','avg','pre_close','factor','paused','gap_fill']
                         if fields is None:
-                            use_fields = default_fields
+                            use_fields = ['open','close','high','low','volume']
                         else:
                             if isinstance(fields, str):
                                 use_fields = [fields]
                             else:
                                 use_fields = list(fields)
-                        cols_exist = [c for c in use_fields if c in tail.columns]
-                        out = tail[['datetime', *cols_exist]].copy()
-                        out.index = out['datetime'].dt.date.astype(str)
-                        out = out.drop(columns=['datetime'])
-                        if isinstance(fields, str):
-                            # 返回 Series
-                            s = out[fields] if fields in out.columns else _pd.Series([], dtype=float)
-                            s.index.name = None
-                            return s
-                        out.index.name = None
-                        return out
+                        # 添加派生字段所需的基础字段
+                        derived_need = []
+                        if 'money' in use_fields or 'avg' in use_fields:
+                            if 'close' not in use_fields: derived_need.append('close')
+                            if 'volume' not in use_fields: derived_need.append('volume')
+                        if 'pre_close' in use_fields:
+                            if 'close' not in use_fields: derived_need.append('close')
+                        base_field_set = set(use_fields + derived_need)
+                        # 过滤非法字段
+                        for f in list(base_field_set):
+                            if f not in all_possible_fields:
+                                base_field_set.remove(f)
+                        # 解析日期 ---------------------------------------------------
+                        def _to_date(x):
+                            if x is None:
+                                return None
+                            if isinstance(x, _dt.datetime):
+                                return x.date()
+                            if isinstance(x, _dt.date):
+                                return x
+                            s = str(x)
+                            try:
+                                return _dt.datetime.fromisoformat(s.replace('/', '-')).date()
+                            except Exception:
+                                return None
+                        cur_bt_date = None
+                        try:
+                            cur_bt_date = bt.num2date(self.data.datetime[0]).date()
+                        except Exception:
+                            pass
+                        end_d = _to_date(end_date)
+                        if end_d is None:
+                            # end_date 默认 = 当前回测日的前一日
+                            if cur_bt_date:
+                                end_d = cur_bt_date - _dt.timedelta(days=1)
+                        start_d = _to_date(start_date)
+                        if count is not None and start_d is not None:
+                            raise ValueError('count 与 start_date 不能同时指定')
+                        if count is None and start_d is None:
+                            # 默认取最近 1 条
+                            count = 1
+                        # 结果容器 ---------------------------------------------------
+                        per_sec_frames = {}
+                        hist_map = jq_state.get('history_df_map') or {}
+                        global_df = jq_state.get('history_df')
+                        for sec in secs:
+                            base = str(sec).split('.')[0]
+                            df_full = None
+                            # 优先精确 key 命中
+                            if base in hist_map:
+                                df_full = hist_map[base]
+                            else:
+                                # 退化匹配
+                                for k, v in hist_map.items():
+                                    if str(k).startswith(base):
+                                        df_full = v
+                                        break
+                            if df_full is None:
+                                df_full = global_df if isinstance(global_df, _pd.DataFrame) else None
+                            if df_full is None or 'datetime' not in df_full.columns:
+                                per_sec_frames[sec] = _pd.DataFrame(columns=use_fields)
+                                continue
+                            df = df_full[['datetime'] + [c for c in ['open','close','high','low','volume'] if c in df_full.columns]].copy()
+                            df['date'] = df['datetime'].dt.date
+                            # 过滤未来：只取 < 当前回测日 的历史
+                            if cur_bt_date is not None:
+                                df = df[df['date'] < cur_bt_date]
+                            if df.empty:
+                                per_sec_frames[sec] = _pd.DataFrame(columns=use_fields)
+                                continue
+                            if count is not None:
+                                # 回溯 count 条（含 end_d）
+                                if end_d is not None:
+                                    df = df[df['date'] <= end_d]
+                                df = df.tail(int(count))
+                            else:
+                                # 区间模式 start_d & end_d
+                                if start_d is not None:
+                                    df = df[df['date'] >= start_d]
+                                if end_d is not None:
+                                    df = df[df['date'] <= end_d]
+                            if df.empty:
+                                per_sec_frames[sec] = _pd.DataFrame(columns=use_fields)
+                                continue
+                            df = df.sort_values('date')
+                            # 补齐缺失日期 + 前值填充 (交易日历优先; fill_paused=True 且未 skip_paused)
+                            synthetic_col = '_synthetic'
+                            if fill_paused and not skip_paused and not df.empty:
+                                first_date = df['date'].iloc[0]
+                                last_date = df['date'].iloc[-1]
+                                cal = jq_state.get('trading_calendar')
+                                if cal:
+                                    span_days = [d for d in cal if first_date <= _dt.datetime.fromisoformat(str(d)).date() <= last_date]
+                                    # cal 中是 str，转换为 date
+                                    span_days = sorted({_dt.datetime.fromisoformat(str(x)).date() for x in span_days})
+                                else:
+                                    span_days = [d.date() for d in _pd.date_range(first_date, last_date, freq='D') if d.weekday() < 5]
+                                existing = set(df['date'])
+                                missing = [d for d in span_days if d not in existing]
+                                if missing:
+                                    add_rows = []
+                                    df_indexed = df.set_index('date')
+                                    for md in missing:
+                                        prev_candidates = [d for d in existing if d < md]
+                                        if not prev_candidates:
+                                            continue
+                                        prev_day = max(prev_candidates)
+                                        prev_row = df_indexed.loc[prev_day]
+                                        ref_close = prev_row['close']
+                                        add_rows.append({
+                                            'datetime': _dt.datetime.combine(md, _dt.time(0, 0)),
+                                            'open': ref_close,
+                                            'close': ref_close,
+                                            'high': ref_close,
+                                            'low': ref_close,
+                                            'volume': 0,
+                                            'date': md,
+                                            synthetic_col: 1
+                                        })
+                                    if add_rows:
+                                        df = _pd.concat([df, _pd.DataFrame(add_rows)], ignore_index=True)
+                                        df = df.sort_values('date').reset_index(drop=True)
+                            # 标记原始行（非填充）
+                            if synthetic_col not in df.columns:
+                                df[synthetic_col] = 0
+                            # gap_fill = 1 表示该行是为了补齐日期的合成行
+                            if 'gap_fill' in base_field_set:
+                                df['gap_fill'] = df[synthetic_col].astype(int)
+                            # 生成派生字段 -------------------------------------
+                            if 'money' in base_field_set and 'money' not in df.columns:
+                                try:
+                                    df['money'] = df['close'] * df['volume']
+                                except Exception:
+                                    df['money'] = _pd.NA
+                            if 'avg' in base_field_set and 'avg' not in df.columns:
+                                try:
+                                    df['avg'] = (df['close'] * df['volume']) / df['volume'].replace(0, _pd.NA)
+                                except Exception:
+                                    df['avg'] = _pd.NA
+                            if 'pre_close' in base_field_set:
+                                df['pre_close'] = df['close'].shift(1)
+                            if 'factor' in base_field_set and 'factor' not in df.columns:
+                                df['factor'] = 1.0  # 占位：真实复权因子需另行加载
+                            if 'paused' in base_field_set:
+                                # 仅对原始数据 volume==0 计为停牌；填充行不算真实停牌
+                                df['paused'] = ((df['volume'] == 0) & (df[synthetic_col] == 0)).astype(int)
+                                # 对新填充的停牌行若需要 money / avg 调整
+                                if 'money' in df.columns:
+                                    df.loc[df['paused'] == 1, 'money'] = df.loc[df['paused'] == 1, 'volume'] * df.loc[df['paused'] == 1, 'close']
+                                if 'avg' in df.columns:
+                                    # 停牌行设为前值 close（与 close 相同）
+                                    df.loc[df['paused'] == 1, 'avg'] = df.loc[df['paused'] == 1, 'close']
+                            # 派生涨跌停 (若请求)
+                            if {'high_limit','low_limit'} & base_field_set:
+                                try:
+                                    limit_pct = float(jq_state['options'].get('limit_pct', 0.1) or 0.1)
+                                except Exception:
+                                    limit_pct = 0.1
+                                # 用 pre_close (若无则 close.shift(1))
+                                if 'pre_close' in df.columns:
+                                    ref_pc = df['pre_close']
+                                else:
+                                    ref_pc = df['close'].shift(1)
+                                tick = float(jq_state['options'].get('price_tick', 0.01) or 0.01)
+                                def _round_tick(v):
+                                    return _math.floor(v / tick + 1e-9) * tick
+                                hl = ref_pc * (1 + limit_pct)
+                                ll = ref_pc * (1 - limit_pct)
+                                df['high_limit'] = hl.map(lambda x: _round_tick(x) if _pd.notnull(x) else x)
+                                df['low_limit'] = ll.map(lambda x: _round_tick(x) if _pd.notnull(x) else x)
+                            # 应用停牌过滤/填充逻辑（近似实现）
+                            if 'paused' in df.columns:
+                                if skip_paused:
+                                    df = df[df['paused'] == 0]
+                                elif not fill_paused:
+                                    # 不填充：将停牌行除 paused 字段外设为 NA
+                                    paused_mask = df['paused'] == 1
+                                    if paused_mask.any():
+                                        for col in df.columns:
+                                            if col not in ('datetime','date','paused'):
+                                                df.loc[paused_mask, col] = _pd.NA
+                            # 选择字段
+                            out_cols = [f for f in use_fields if f in df.columns]
+                            # 如果请求了 paused 但未请求 synthetic，可在调试需求下选择不暴露 synthetic
+                            work = df[['date', *out_cols]].copy()
+                            work.set_index('date', inplace=True)
+                            per_sec_frames[sec] = work
+                        # 单 / 多证券返回格式 -------------------------------------------
+                        if len(secs) == 1:
+                            single_df = per_sec_frames[secs[0]]
+                            # Series 简化
+                            if isinstance(fields, str):
+                                series = single_df[fields] if fields in single_df.columns else _pd.Series([], dtype=float)
+                                series.index.name = None
+                                return series
+                            single_df.index.name = None
+                            return single_df
+                        # 多证券
+                        if panel:
+                            # 构造一个简单 Panel 模拟器
+                            class PanelEmu:
+                                def __init__(self, data_map):  # data_map: sec -> DataFrame
+                                    # 统一日期集合
+                                    all_dates = sorted({d for df in data_map.values() for d in df.index})
+                                    self._fields = set()
+                                    self._dates = all_dates
+                                    self._secs = list(data_map.keys())
+                                    self._cube = {}
+                                    for f in use_fields:
+                                        # 构建 DataFrame 行=日期 列=证券
+                                        mat = _pd.DataFrame(index=all_dates, columns=self._secs, dtype=float)
+                                        for sec, df in data_map.items():
+                                            if f in df.columns:
+                                                mat.loc[df.index, sec] = df[f]
+                                        self._cube[f] = mat
+                                        self._fields.add(f)
+                                def __getitem__(self, item):
+                                    return self._cube.get(item, _pd.DataFrame())
+                                @property
+                                def fields(self):
+                                    return list(self._fields)
+                                @property
+                                def symbols(self):
+                                    return list(self._secs)
+                            return PanelEmu(per_sec_frames)
+                        # 默认: 返回 dict{sec: DataFrame}
+                        return per_sec_frames
                     exec_env['get_price'] = get_price
+                # --- history (JoinQuant style, daily only) ---
+                if isinstance(exec_env, dict) and 'history' not in exec_env:
+                    def history(count: int,
+                                unit: str = '1d',
+                                field: str = 'avg',
+                                security_list=None,
+                                df: bool = True,
+                                skip_paused: bool = False,
+                                fq: str = 'pre'):
+                        """近似聚宽 history：仅支持日级。
+                        参数:
+                          count: 回溯条数（不含当前正在运行的当日）
+                          unit: 仅支持 '1d'
+                          field: 单字段，可选 open/close/high/low/volume/money/avg/pre_close/paused
+                          security_list: 单个或列表；None 时尝试 jq_state['universe'] 或 g.security
+                          df: True 返回 DataFrame(index=日期, columns=证券代码)；False 返回 dict{sec: np.ndarray}
+                          skip_paused: True 删掉停牌( volume==0 ) 行（各列都删除）
+                          fq: 复权标识，占位不做转换
+                        行为：
+                          - 不包含当前 bar 日期
+                          - 若个别证券数据不足 count，会返回尽可能多的历史；不强制齐全
+                          - 日期索引升序
+                        差异/限制：
+                          - 不支持分钟级
+                          - 未实现 high_limit / low_limit / factor 真值；如需可扩展
+                        """
+                        import pandas as _pd
+                        import numpy as _np
+                        import datetime as _dt
+                        if unit.lower() not in ('1d', 'd', 'day'):
+                            raise ValueError('history 目前仅支持日级 unit=1d')
+                        if count <= 0:
+                            return _pd.DataFrame() if df else {}
+                        # 解析证券列表
+                        if security_list is None:
+                            jqst = exec_env.get('jq_state', {})
+                            universe = jqst.get('universe') or []
+                            if universe:
+                                secs = list(universe)
+                            else:
+                                # fallback: 尝试 g.security
+                                gobj = exec_env.get('g')
+                                primary = getattr(gobj, 'security', None) if gobj else None
+                                secs = [primary] if primary else []
+                        else:
+                            if isinstance(security_list, (list, tuple, set)):
+                                secs = list(security_list)
+                            else:
+                                secs = [security_list]
+                        secs = [s for s in secs if s]
+                        if not secs:
+                            return _pd.DataFrame() if df else {}
+                        # 当前回测日
+                        try:
+                            cur_date = bt.num2date(self.data.datetime[0]).date()
+                        except Exception:
+                            cur_date = None
+                        # helper 取单证券 DataFrame
+                        get_price_fn = exec_env.get('get_price')
+                        results = {}
+                        needed_field = field
+                        # 若 field 为 avg/price 且数据里没有，将用 close 近似
+                        for sec in secs:
+                            try:
+                                base_fields = None
+                                if field in ('avg', 'price'):
+                                    base_fields = ['close', 'volume']
+                                elif field == 'money':
+                                    base_fields = ['close', 'volume']
+                                elif field == 'pre_close':
+                                    base_fields = ['close']
+                                elif field == 'paused':
+                                    base_fields = ['paused']
+                                elif field == 'gap_fill':
+                                    base_fields = ['gap_fill']
+                                else:
+                                    base_fields = [field]
+                                df_single = get_price_fn(sec, count=count, fields=base_fields, skip_paused=skip_paused, fq=fq, fill_paused=True)
+                                if isinstance(df_single, _pd.Series):
+                                    df_single = df_single.to_frame(name=base_fields[0])
+                                # 计算派生字段
+                                if field == 'avg' or field == 'price':
+                                    if 'close' in df_single.columns:
+                                        series_field = df_single['close']
+                                    else:
+                                        series_field = _pd.Series([], dtype=float)
+                                elif field == 'money':
+                                    if {'close','volume'} <= set(df_single.columns):
+                                        series_field = df_single['close'] * df_single['volume']
+                                    else:
+                                        series_field = _pd.Series([], dtype=float)
+                                elif field == 'pre_close':
+                                    if 'close' in df_single.columns:
+                                        series_field = df_single['close'].shift(1)
+                                    else:
+                                        series_field = _pd.Series([], dtype=float)
+                                elif field == 'paused':
+                                    if 'paused' in df_single.columns:
+                                        series_field = df_single['paused']
+                                    else:
+                                        tmp_df = get_price_fn(sec, count=count, fields=['paused'], skip_paused=False, fq=fq, fill_paused=True)
+                                        if isinstance(tmp_df, _pd.Series):
+                                            series_field = tmp_df
+                                        else:
+                                            series_field = tmp_df.get('paused', _pd.Series([], dtype=int))
+                                else:
+                                    # 直接取字段
+                                    if field in df_single.columns:
+                                        series_field = df_single[field]
+                                    else:
+                                        # 尝试重新获取包含该字段
+                                        tmp_df = get_price_fn(sec, count=count, fields=[field], skip_paused=skip_paused, fq=fq, fill_paused=True)
+                                        if isinstance(tmp_df, _pd.Series):
+                                            series_field = tmp_df
+                                        else:
+                                            series_field = tmp_df[field] if field in tmp_df.columns else _pd.Series([], dtype=float)
+                                # 限制为 count 条（防止前值填充扩展超出）
+                                series_field = series_field.tail(count)
+                                series_field.name = sec
+                                results[sec] = series_field
+                            except Exception:
+                                results[sec] = _pd.Series([], name=sec, dtype=float)
+                        # 对齐索引（并集）
+                        all_index = sorted({idx for s in results.values() for idx in s.index})
+                        def _reindex(s):
+                            return s.reindex(all_index)
+                        if df:
+                            data_map = {sec: _reindex(s) for sec, s in results.items()}
+                            out_df = _pd.DataFrame(data_map, index=all_index)
+                            # 自定义 Series 以支持负整数位置索引
+                            class _HSeries(_pd.Series):
+                                @property
+                                def _constructor(self):
+                                    return _HSeries
+                                def __getitem__(self, key):
+                                    if isinstance(key, int):
+                                        return self.iloc[key]
+                                    if isinstance(key, slice):
+                                        ok = lambda x: (x is None) or isinstance(x, int)
+                                        if ok(key.start) and ok(key.stop) and (key.step is None or isinstance(key.step, int)):
+                                            return _HSeries(self.iloc[key])
+                                    return super().__getitem__(key)
+                            class _HDataFrame(_pd.DataFrame):
+                                @property
+                                def _constructor(self):
+                                    return _HDataFrame
+                                def __getitem__(self, key):
+                                    obj = super().__getitem__(key)
+                                    if isinstance(obj, _pd.Series):
+                                        return _HSeries(obj)
+                                    return obj
+                            return _HDataFrame(out_df)
+                        else:
+                            return {sec: _reindex(s).to_numpy(dtype=float) for sec, s in results.items()}
+                    exec_env['history'] = history
                 # --- Corporate Actions (simulate_corporate_actions) ---
                 try:
                     if jq_state.get('corporate_actions'):
@@ -463,138 +854,157 @@ def compile_user_strategy(code: str):
                 except Exception:
                     pass
                 # 继续原有逻辑
-                def attribute_history(security: str, n: int, unit: str, fields: List[str]):
-                    # 支持 unit 为 '1d' 或 '1D' 或 'day'
-                    if unit.lower() not in ('1d', 'day', 'd'):
-                        raise ValueError('attribute_history 目前仅支持日级 unit=1d')
+                def attribute_history(security, count, unit='1d', fields=None, skip_paused=True, df=True, fq='pre'):
+                    """JoinQuant 风格 attribute_history 近似实现 (仅日级)。
+                    兼容旧调用: attribute_history(sec, n, '1d', ['close']).
+                    参数:
+                      security: 证券代码
+                      count: 回溯条数 (不含当前正在执行的当日，除非开启 attribute_history_include_current)
+                      unit: 仅支持 '1d'
+                      fields: list/tuple/str，默认 ['open','close','high','low','volume','money']
+                      skip_paused: True 删除停牌日 (volume==0)；False 保留并前值填充（依赖 get_price fill_paused）
+                      df: True 返回 DataFrame (index=日期升序)；False 返回 dict{field: np.ndarray}
+                      fq: 'pre'|'post'|'None' 占位，不做真实复权转换（由数据文件决定）
+                    差异: 未实现 factor/high_limit/low_limit 真值；factor 恒为1.0（若请求）。
+                                        新增字段:
+                                            gap_fill: 1 表示该行是补齐缺失交易日的合成前值行（非真实停牌且 paused=0）。
+                    """
                     import pandas as _pd
-                    # 方案A: 增加开关 attribute_history_include_current (默认 False)，
-                    # True 时包含“当前bar”(即当前交易日)；False 保持聚宽语义(不含当日)
+                    import numpy as _np
+                    if unit.lower() not in ('1d','day','d'):
+                        raise ValueError('attribute_history 目前仅支持日级 unit=1d')
+                    # 包含当前 bar 开关
                     try:
                         _include_cur = bool(exec_env['jq_state']['options'].get('attribute_history_include_current', False))
                     except Exception:
                         _include_cur = False
-                    # JQ 兼容：Series/DF 支持使用负整数做“位置”索引，如 s[-1] 代表最后一项
-                    class _JQSeries(_pd.Series):
-                        @property
-                        def _constructor(self):
-                            return _JQSeries
-
-                        def __getitem__(self, key):
-                            # 如果是整数或整型切片，则按位置 iloc 处理（与聚宽兼容）
-                            if isinstance(key, int):
-                                return self.iloc[key]
-                            if isinstance(key, slice):
-                                is_int = lambda x: (x is None) or isinstance(x, int)
-                                if is_int(key.start) and is_int(key.stop) and (key.step is None or isinstance(key.step, int)):
-                                    return _JQSeries(self.iloc[key])
-                            return super().__getitem__(key)
-
-                    class _JQDataFrame(_pd.DataFrame):
-                        @property
-                        def _constructor(self):
-                            return _JQDataFrame
-
-                        @property
-                        def _constructor_sliced(self):
-                            # 让 df['col'] 返回的 Series 具备负整数位置索引语义
-                            return _JQSeries
-
-                        def __getitem__(self, key):
-                            # 若 key 为整数或整型切片，则按位置 iloc 处理（与聚宽兼容）
-                            if isinstance(key, int):
-                                return self.iloc[key]
-                            if isinstance(key, slice):
-                                is_int = lambda x: (x is None) or isinstance(x, int)
-                                if is_int(key.start) and is_int(key.stop) and (key.step is None or isinstance(key.step, int)):
-                                    return _JQDataFrame(self.iloc[key])
-                            return super().__getitem__(key)
-
-                    jqst = exec_env['jq_state']
-                    # 计算当前日期
+                    # 规范 fields
+                    if fields is None:
+                        fields_list = ['open','close','high','low','volume','money']
+                    else:
+                        if isinstance(fields, str):
+                            fields_list = [fields]
+                        else:
+                            fields_list = list(fields)
+                    # 去重保持顺序
+                    seen = set(); ordered = []
+                    for f in fields_list:
+                        if f not in seen:
+                            ordered.append(f); seen.add(f)
+                    fields_list = ordered
+                    # 若请求 factor 且未在数据中存在 -> 占位
+                    need_factor = 'factor' in fields_list
+                    # 获取完整历史 (用 get_price 以利用其 fill_paused + 日期补齐)
+                    get_price_fn = exec_env.get('get_price')
+                    # get_price count 包含 end_date 自身；我们需要 count 条不含今日
+                    # 先抓 (count + (1 if not _include_cur else 0)) 条，然后再裁剪
+                    gp_extra = count if _include_cur else count
+                    # 使用基础字段集合以便派生 money/factor
+                    base_reqs = set(fields_list)
+                    # Option C: 若用户请求 volume 且 skip_paused=False，自动附加 paused 字段用于区分真实停牌
+                    auto_add_paused = False
+                    if (not skip_paused) and ('volume' in base_reqs) and ('paused' not in base_reqs):
+                        base_reqs.add('paused')
+                        auto_add_paused = True
+                    # money 需要 close + volume
+                    if 'money' in base_reqs:
+                        base_reqs.update(['close','volume'])
+                    # 如果要 skip_paused，需要 paused 字段
+                    if skip_paused:
+                        base_reqs.add('paused')
+                    # high_limit/low_limit 需要 pre_close (或 close.shift(1))
+                    if 'high_limit' in base_reqs or 'low_limit' in base_reqs:
+                        base_reqs.add('close')
+                        base_reqs.add('pre_close')
+                    # factor 占位不增加依赖；无特别处理
+                    base_fields = list(base_reqs)
+                    raw_df = get_price_fn(security, count=gp_extra+5, fields=base_fields, skip_paused=False, fq=fq, fill_paused=True)  # +5 冗余确保筛后足够
+                    if isinstance(raw_df, _pd.Series):
+                        raw_df = raw_df.to_frame(name=base_fields[0])
+                    # 过滤未来日期（不含今日）除非 include_cur
                     try:
                         cur_date = bt.num2date(self.data.datetime[0]).date()
                     except Exception:
                         cur_date = None
-                    # 根据传入 security 选择对应的完整历史
-                    full_df = None
-                    try:
-                        sym_map = jqst.get('history_df_map') or {}
-                        base = str(security).split('.')[0]
-                        # 先精确匹配 key == base，再匹配以 base_ 开头
-                        if base in sym_map:
-                            full_df = sym_map[base]
-                        else:
-                            for k, v in sym_map.items():
-                                if str(k).startswith(base + '_') or str(k).startswith(base):
-                                    full_df = v
-                                    break
-                        if full_df is None:
-                            full_df = jqst.get('history_df')
-                    except Exception:
-                        full_df = jqst.get('history_df')
-                    if isinstance(full_df, _pd.DataFrame) and cur_date is not None:
-                        # 根据开关决定是否包含当日
+                    if cur_date is not None:
                         if _include_cur:
-                            df = full_df[full_df['datetime'].dt.date <= cur_date]
+                            raw_df = raw_df[raw_df.index <= cur_date]
                         else:
-                            df = full_df[full_df['datetime'].dt.date < cur_date]
-                        if df.empty:
-                            return _JQDataFrame({f: [] for f in fields})
-                        tail = df.tail(n)
-                        out = tail[['datetime', *fields]].copy()
-                        out.index = out['datetime'].dt.date.astype(str)
-                        # 与聚宽展示一致，不显示索引名
+                            raw_df = raw_df[raw_df.index < cur_date]
+                    # 卷尾截取最新 count 行
+                    work = raw_df.tail(count)
+                    # 生成派生字段 (money, factor, high_limit/low_limit)
+                    if 'money' in fields_list and 'money' not in work.columns:
+                        if {'close','volume'} <= set(work.columns):
+                            work['money'] = work['close'] * work['volume']
+                        else:
+                            work['money'] = _pd.NA
+                    if need_factor and 'factor' not in work.columns:
+                        work['factor'] = 1.0
+                    if 'high_limit' in fields_list or 'low_limit' in fields_list:
                         try:
-                            out.index.name = None
+                            limit_pct = float(exec_env['jq_state']['options'].get('limit_pct', 0.1) or 0.1)
                         except Exception:
-                            pass
-                        out = out.drop(columns=['datetime'])
-                        return _JQDataFrame(out)
-                    # 回退：直接从数据行取，尽量用日期索引
-                    # 根据开关决定 available 是否包含当前 bar
-                    if _include_cur:
-                        available = max(len(self.data), 0)  # 允许包含当前bar
-                    else:
-                        available = max(len(self.data) - 1, 0)  # 不包含当前bar（索引0）
-                    length = min(n, available)
-                    if length <= 0:
-                        return _JQDataFrame({f: [] for f in fields})
-                    data_dict: Dict[str, List[float]] = {}
-                    for f in fields:
-                        line = getattr(self.data, f, None)
-                        if line is None:
-                            data_dict[f] = [float('nan')] * length
-                            continue
-                        # 取“之前”的 length 条；含当日则区间为 [-length+1, ..., 0]
-                        if _include_cur:
-                            start_idx = -length + 1 if length > 0 else 1
-                            vals = [line[i] for i in range(start_idx, 1)] if length > 0 else []
-                        else:
-                            # 不含当日：[-length, ..., -1]
-                            vals = [line[i] for i in range(-length, 0)] if length > 0 else []
-                        data_dict[f] = vals
-                    # 构造日期索引（更稳健：逐条读取末尾 length 个 bar 的日期，排除当日）
+                            limit_pct = 0.1
+                        ref_pc = work['pre_close'] if 'pre_close' in work.columns else work['close'].shift(1)
+                        tick = float(exec_env['jq_state']['options'].get('price_tick', 0.01) or 0.01)
+                        def _round_tick(v):
+                            return _math.floor(v / tick + 1e-9) * tick
+                        if 'high_limit' in fields_list:
+                            work['high_limit'] = ref_pc * (1 + limit_pct)
+                            work['high_limit'] = work['high_limit'].map(lambda x: _round_tick(x) if _pd.notnull(x) else x)
+                        if 'low_limit' in fields_list:
+                            work['low_limit'] = ref_pc * (1 - limit_pct)
+                            work['low_limit'] = work['low_limit'].map(lambda x: _round_tick(x) if _pd.notnull(x) else x)
+                    # skip_paused: 使用 paused 字段（原始停牌），若无则回退到 volume
+                    if skip_paused:
+                        if 'paused' in work.columns:
+                            work = work[work['paused'] == 0]
+                        elif 'volume' in work.columns:
+                            work = work[work['volume'] != 0]
+                    # 只留请求字段顺序；若自动附加了 paused，则保留它方便用户统计真实停牌
+                    keep_cols = [c for c in fields_list if c in work.columns]
+                    if auto_add_paused and 'paused' in work.columns and 'paused' not in keep_cols:
+                        keep_cols.append('paused')
+                    work = work[keep_cols]
+                    # 结果 DataFrame 升序，索引去 name
+                    work = work.sort_index()
                     try:
-                        # 使用索引逐条转换，包含/不包含当日由 _include_cur 控制
-                        str_idx = []
-                        if _include_cur:
-                            for i in range(-length + 1, 1):
-                                dt_num = self.data.datetime[i]
-                                dt_str = bt.num2date(dt_num).date().isoformat()
-                                str_idx.append(dt_str)
-                        else:
-                            for i in range(-length, 0):
-                                dt_num = self.data.datetime[i]
-                                dt_str = bt.num2date(dt_num).date().isoformat()
-                                str_idx.append(dt_str)
+                        work.index.name = None
                     except Exception:
-                        # 仍然失败则退回负索引
-                        if _include_cur:
-                            str_idx = list(range(-length + 1, 1))
-                        else:
-                            str_idx = list(range(-length, 0))
-                    return _JQDataFrame(_pd.DataFrame(data_dict, index=str_idx))
+                        pass
+                    # 负整数位置索引支持
+                    class _JQSeries(_pd.Series):
+                        @property
+                        def _constructor(self):
+                            return _JQSeries
+                        def __getitem__(self, key):
+                            if isinstance(key, int):
+                                return self.iloc[key]
+                            if isinstance(key, slice):
+                                ok = lambda x: (x is None) or isinstance(x, int)
+                                if ok(key.start) and ok(key.stop) and (key.step is None or isinstance(key.step, int)):
+                                    return _JQSeries(self.iloc[key])
+                            return super().__getitem__(key)
+                    class _JQDataFrame(_pd.DataFrame):
+                        @property
+                        def _constructor(self):
+                            return _JQDataFrame
+                        @property
+                        def _constructor_sliced(self):
+                            return _JQSeries
+                        def __getitem__(self, key):
+                            if isinstance(key, int):
+                                return self.iloc[key]
+                            if isinstance(key, slice):
+                                ok = lambda x: (x is None) or isinstance(x, int)
+                                if ok(key.start) and ok(key.stop) and (key.step is None or isinstance(key.step, int)):
+                                    return _JQDataFrame(self.iloc[key])
+                            return super().__getitem__(key)
+                    if df:
+                        return _JQDataFrame(work)
+                    else:
+                        return {c: work[c].to_numpy(dtype=float) for c in keep_cols}
 
                 def order_value(security: str, value: float):
                     """按金额下单（聚宽语义近似）：
