@@ -22,6 +22,8 @@ class BacktestRequest(BaseModel):
     benchmark_symbol: Optional[str] = None
     strategy_code: str
     strategy_params: Optional[Dict[str, Any]] = None
+    frequency: str = 'daily'           # 新增: '1min' | 'daily' | 'weekly' | 'monthly'
+    adjust_type: str = 'auto'          # 新增: 'auto' | 'raw' | 'qfq' | 'hfq'
 
 @app.get('/')
 async def index():
@@ -41,6 +43,8 @@ async def api_backtest(req: BacktestRequest):
         req.strategy_code,
         req.strategy_params,
         benchmark_symbol=req.benchmark_symbol,
+        frequency=req.frequency,
+        adjust_type=req.adjust_type,
     )
     # 使用 asdict 递归转换 dataclass, 否则 TradeRecord 列表无法直接 JSON 序列化
     return JSONResponse(asdict(result))

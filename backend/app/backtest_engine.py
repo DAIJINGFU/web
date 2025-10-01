@@ -12,6 +12,8 @@ from typing import Dict, Any, List, Optional, Callable
 import backtrader as bt
 import pandas as pd
 from .corporate_actions import load_corporate_actions, apply_event
+# 新增统一数据加载接口
+from . import data_loader as _dl
 
 
 def _round_to_tick(value: float, tick: float) -> float:
@@ -27,56 +29,22 @@ def _round_to_tick(value: float, tick: float) -> float:
 # 数据加载器 (简化版本)
 # -----------------------------
 
-# 读取数据映射成英文
-def _read_raw_df(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # 兼容中文列名 -> 英文
-    rename_map = {
-        '日期': 'datetime',
-        '开盘': 'open',
-        '最高': 'high',
-        '最低': 'low',
-        '收盘': 'close',
-        '成交量': 'volume',
-        '股票代码': 'code',
-    }
-    # 仅重命名存在的列
-    cols = {c: rename_map[c] for c in df.columns if c in rename_map}
-    if cols:
-        df = df.rename(columns=cols)
-    # 若没有 datetime 列尝试 date
-    if 'datetime' not in df.columns:
-        for candidate in ['date', 'Date']:
-            if candidate in df.columns:
-                df = df.rename(columns={candidate: 'datetime'})
-                break
-    if 'datetime' not in df.columns:
-        raise ValueError('CSV 缺少日期列 (datetime / 日期)')
-    return df
+def load_csv_dataframe(symbol: str, start: str, end: str, datadir: str = 'data') -> pd.DataFrame:  # backward compat
+    """兼容旧接口：从 data/ 或 stockdata/ 中加载日线数据 (优先新 stockdata)."""
+    prefer_stockdata = bool(int(os.environ.get('PREFER_STOCKDATA', '1')))
+    # adjust 决策：若环境指定 ADJUST_TYPE 使用之，否则 auto
+    adjust = os.environ.get('ADJUST_TYPE', 'auto').lower()
+    try:
+        return _dl.load_price_dataframe(symbol, start, end, frequency='daily', adjust=adjust, prefer_stockdata=prefer_stockdata,
+                                        data_root=datadir, stockdata_root=None)
+    except Exception as e:
+        raise e
 
-# 切片回测时间段
-def load_csv_dataframe(symbol: str, start: str, end: str, datadir: str = 'data') -> pd.DataFrame:
-    path = f"{datadir}/{symbol}.csv"
-    if not os.path.exists(path):
-        raise FileNotFoundError(f'未找到数据文件: {path}')
-    df = _read_raw_df(path)
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    mask = (df['datetime'] >= pd.to_datetime(start)) & (df['datetime'] <= pd.to_datetime(end))
-    df = df.loc[mask].sort_values('datetime').reset_index(drop=True)
-    return df
-
-# 转换DF为PD
-def load_csv_data(symbol: str, start: str, end: str, datadir: str = 'data') -> bt.feeds.PandasData:
-    """读取 CSV 并返回供 backtrader 使用的 DataFeed (兼容中文列)。"""
-    df = load_csv_dataframe(symbol, start, end, datadir)
-    # 只保留必要列
-    required = ['datetime', 'open', 'high', 'low', 'close', 'volume']
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f'数据文件缺少必要列: {missing}')
-    feed_df = df[required].copy()
-    feed_df.set_index('datetime', inplace=True)
-    return bt.feeds.PandasData(dataname=feed_df)
+def load_csv_data(symbol: str, start: str, end: str, datadir: str = 'data') -> bt.feeds.PandasData:  # backward compat
+    prefer_stockdata = bool(int(os.environ.get('PREFER_STOCKDATA', '1')))
+    adjust = os.environ.get('ADJUST_TYPE', 'auto').lower()
+    return _dl.load_bt_feed(symbol, start, end, frequency='daily', adjust=adjust, prefer_stockdata=prefer_stockdata,
+                             data_root=datadir, stockdata_root=None)
 
 # -----------------------------
 # 回测结果模型
@@ -151,6 +119,8 @@ ALLOWED_GLOBALS = {
         'bool': bool,
         'isinstance': isinstance,
         'print': print,
+        '__build_class__': __build_class__,  # 允许用户定义类（策略类等）
+    '__name__': '__main__',
     },
     'bt': bt,
     'pd': pd,
@@ -428,7 +398,7 @@ def compile_user_strategy(code: str):
                         else:
                             secs = [security]
                         # 默认字段
-                        all_possible_fields = ['open','close','high','low','volume','money','avg','pre_close','factor','paused','gap_fill']
+                        all_possible_fields = ['open','close','high','low','volume','money','avg','pre_close','factor','paused']
                         if fields is None:
                             use_fields = ['open','close','high','low','volume']
                         else:
@@ -521,49 +491,10 @@ def compile_user_strategy(code: str):
                                 per_sec_frames[sec] = _pd.DataFrame(columns=use_fields)
                                 continue
                             df = df.sort_values('date')
-                            # 补齐缺失日期 + 前值填充 (交易日历优先; fill_paused=True 且未 skip_paused)
+                            # 去除自动补齐缺失交易日逻辑：只保留原始数据行
                             synthetic_col = '_synthetic'
-                            if fill_paused and not skip_paused and not df.empty:
-                                first_date = df['date'].iloc[0]
-                                last_date = df['date'].iloc[-1]
-                                cal = jq_state.get('trading_calendar')
-                                if cal:
-                                    span_days = [d for d in cal if first_date <= _dt.datetime.fromisoformat(str(d)).date() <= last_date]
-                                    # cal 中是 str，转换为 date
-                                    span_days = sorted({_dt.datetime.fromisoformat(str(x)).date() for x in span_days})
-                                else:
-                                    span_days = [d.date() for d in _pd.date_range(first_date, last_date, freq='D') if d.weekday() < 5]
-                                existing = set(df['date'])
-                                missing = [d for d in span_days if d not in existing]
-                                if missing:
-                                    add_rows = []
-                                    df_indexed = df.set_index('date')
-                                    for md in missing:
-                                        prev_candidates = [d for d in existing if d < md]
-                                        if not prev_candidates:
-                                            continue
-                                        prev_day = max(prev_candidates)
-                                        prev_row = df_indexed.loc[prev_day]
-                                        ref_close = prev_row['close']
-                                        add_rows.append({
-                                            'datetime': _dt.datetime.combine(md, _dt.time(0, 0)),
-                                            'open': ref_close,
-                                            'close': ref_close,
-                                            'high': ref_close,
-                                            'low': ref_close,
-                                            'volume': 0,
-                                            'date': md,
-                                            synthetic_col: 1
-                                        })
-                                    if add_rows:
-                                        df = _pd.concat([df, _pd.DataFrame(add_rows)], ignore_index=True)
-                                        df = df.sort_values('date').reset_index(drop=True)
-                            # 标记原始行（非填充）
                             if synthetic_col not in df.columns:
-                                df[synthetic_col] = 0
-                            # gap_fill = 1 表示该行是为了补齐日期的合成行
-                            if 'gap_fill' in base_field_set:
-                                df['gap_fill'] = df[synthetic_col].astype(int)
+                                df[synthetic_col] = 0  # 占位，后续 paused 逻辑兼容
                             # 生成派生字段 -------------------------------------
                             if 'money' in base_field_set and 'money' not in df.columns:
                                 try:
@@ -580,14 +511,8 @@ def compile_user_strategy(code: str):
                             if 'factor' in base_field_set and 'factor' not in df.columns:
                                 df['factor'] = 1.0  # 占位：真实复权因子需另行加载
                             if 'paused' in base_field_set:
-                                # 仅对原始数据 volume==0 计为停牌；填充行不算真实停牌
-                                df['paused'] = ((df['volume'] == 0) & (df[synthetic_col] == 0)).astype(int)
-                                # 对新填充的停牌行若需要 money / avg 调整
-                                if 'money' in df.columns:
-                                    df.loc[df['paused'] == 1, 'money'] = df.loc[df['paused'] == 1, 'volume'] * df.loc[df['paused'] == 1, 'close']
-                                if 'avg' in df.columns:
-                                    # 停牌行设为前值 close（与 close 相同）
-                                    df.loc[df['paused'] == 1, 'avg'] = df.loc[df['paused'] == 1, 'close']
+                                # 仅对原始数据 volume==0 计为停牌
+                                df['paused'] = (df['volume'] == 0).astype(int)
                             # 派生涨跌停 (若请求)
                             if {'high_limit','low_limit'} & base_field_set:
                                 try:
@@ -737,8 +662,6 @@ def compile_user_strategy(code: str):
                                     base_fields = ['close']
                                 elif field == 'paused':
                                     base_fields = ['paused']
-                                elif field == 'gap_fill':
-                                    base_fields = ['gap_fill']
                                 else:
                                     base_fields = [field]
                                 df_single = get_price_fn(sec, count=count, fields=base_fields, skip_paused=skip_paused, fq=fq, fill_paused=True)
@@ -867,7 +790,7 @@ def compile_user_strategy(code: str):
                       fq: 'pre'|'post'|'None' 占位，不做真实复权转换（由数据文件决定）
                     差异: 未实现 factor/high_limit/low_limit 真值；factor 恒为1.0（若请求）。
                                         新增字段:
-                                            gap_fill: 1 表示该行是补齐缺失交易日的合成前值行（非真实停牌且 paused=0）。
+                                            (已移除 gap_fill：不再自动补齐缺失交易日)
                     """
                     import pandas as _pd
                     import numpy as _np
@@ -1413,6 +1336,8 @@ def run_backtest(
     strategy_code: str,
     strategy_params: Optional[Dict[str, Any]] = None,
     benchmark_symbol: Optional[str] = None,
+    frequency: str = 'daily',
+    adjust_type: str = 'auto',
     datadir: str = 'data',
 ) -> BacktestResult:
     log_buffer = io.StringIO()
@@ -1437,6 +1362,10 @@ def run_backtest(
                     jq_state['log'].append(f"[preparse] detected adjust_type={m_adj.group(1).lower()} in source code")
         except Exception:
             pass
+        # 若调用方传入 adjust_type / frequency 且用户未在策略 set_option 指定，则采用传入值
+        if 'adjust_type' not in jq_state.get('options', {}):
+            jq_state['options']['adjust_type'] = adjust_type
+        jq_state['options']['api_frequency'] = frequency
         # 创建 cerebro（根据成交价类型决定 cheat_on_open）
         fill_price_opt = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
         try:
@@ -1503,235 +1432,31 @@ def run_backtest(
         except Exception:
             pass
 
-        # 2. 标的解析与数据加载 (精简 & 明确)
-        # 目标：
-        #  1) 根据输入代码(可含 .XSHE/.XSHG 或带 *_daily_qfq 等后缀) 解析出核心代码 core (纯数字部分)。
-        #  2) 按统一的“候选后缀优先级”生成文件名候选列表并选择第一个存在的。
-        #  3) 优先级来源 = adjust_type + use_real_price + 用户 data_source_preference + force_data_variant + respect_symbol_suffix。
-        #  4) use_real_price=True: 未复权(raw)优先；False: 前复权(qfq)优先（保持之前语义）。
-        #  5) adjust_type 显式指定则覆盖 use_real_price 的默认推导。
-        #  6) respect_symbol_suffix=True 时，如果用户直接给了带后缀名字，直接用（存在则用，不存在报 fallback 说明）。
-        # 输出日志：
-        #  [symbol_select] core=... adjust=... use_real_price=... respect_suffix=... candidates=... chosen=...
-        #  [symbol_force]  若 force_data_variant 命中
-        #  [symbol_warn]   未找到任何存在文件（将返回首个候选继续让后续 FileNotFound 暴露）
-
-        _SUFFIX_RAW = ['_daily', '_日']
-        _SUFFIX_QFQ = ['_daily_qfq', '_日_qfq']
-        _SUFFIX_HFQ = ['_daily_hfq', '_日_hfq']
-        _ALL_SUFFIXES = _SUFFIX_RAW + _SUFFIX_QFQ + _SUFFIX_HFQ
-
-        def _opt(name: str, default=None):
-            try:
-                return jq_state.get('options', {}).get(name, default)
-            except Exception:
-                return default
-
-        def _normalize_code(code: str) -> str:
-            c = code.strip()
-            c = c.replace('.XSHE', '').replace('.XSHG', '').replace('.xshe', '').replace('.xshg', '')
-            for suf in sorted(_ALL_SUFFIXES, key=len, reverse=True):
-                if c.lower().endswith(suf):
-                    return c[:-len(suf)], suf  # (core, provided_suffix)
-            return c, ''
-
-        def _decide_adjust() -> str:
-            adj = _opt('adjust_type')
-            if isinstance(adj, str) and adj.lower() in ('raw','qfq','hfq','auto'):
-                return adj.lower()
-            return 'auto'
-
-        def _candidate_suffix_sequence(use_real_price_flag: bool, adjust_type: str) -> List[str]:
-            # adjust_type 显式优先
-            if adjust_type == 'raw':
-                base_seq = _SUFFIX_RAW + _SUFFIX_QFQ + _SUFFIX_HFQ
-            elif adjust_type == 'qfq':
-                base_seq = _SUFFIX_QFQ + _SUFFIX_RAW + _SUFFIX_HFQ
-            elif adjust_type == 'hfq':
-                base_seq = _SUFFIX_HFQ + _SUFFIX_RAW + _SUFFIX_QFQ
-            else:  # auto
-                if use_real_price_flag:
-                    base_seq = _SUFFIX_RAW + _SUFFIX_QFQ + _SUFFIX_HFQ
-                else:
-                    base_seq = _SUFFIX_QFQ + _SUFFIX_RAW + _SUFFIX_HFQ
-            # 用户 preference 追加（末尾去重保序）
-            user_pref = _opt('data_source_preference')
-            if isinstance(user_pref, (list, tuple)):
-                seq = []
-                seen = set()
-                for suf in list(base_seq) + list(user_pref):
-                    if suf not in seen and isinstance(suf, str):
-                        seen.add(suf)
-                        seq.append(suf)
-                return seq
-            return list(base_seq)
-
-        def _apply_force_variant(core: str) -> Optional[str]:
-            force = _opt('force_data_variant')
-            if isinstance(force, str):
-                fmap = {'daily':'_daily','raw':'_daily','qfq':'_daily_qfq','hfq':'_daily_hfq','日':'_日'}
-                suf = fmap.get(force.lower().strip())
-                if suf:
-                    candidate = core + suf
-                    path = os.path.join(datadir, candidate + '.csv')
-                    if os.path.exists(path):
-                        jq_state['log'].append(f"[symbol_force] using={candidate}.csv force_data_variant={force}")
-                        return candidate
-                    else:
-                        jq_state['log'].append(f"[symbol_force] missing={candidate}.csv (will fallback)")
-            return None
-
-        def _select_one(raw_code: str) -> str:
-            core, provided_suffix = _normalize_code(raw_code)
-            respect = bool(_opt('respect_symbol_suffix', False))
-            use_real_price_flag = bool(_opt('use_real_price', False))
-            strict_real_price_flag = bool(_opt('strict_real_price', False))
-            adjust = _decide_adjust()
-            # 如果用户提供后缀且 respect=True 直接使用
-            if provided_suffix and respect:
-                direct = core + provided_suffix
-                path = os.path.join(datadir, direct + '.csv')
-                if os.path.exists(path):
-                    jq_state['log'].append(
-                        f"[symbol_select] mode=respect direct={direct} adjust={adjust} use_real_price={use_real_price_flag}"
-                    )
-                    return direct
-                else:
-                    jq_state['log'].append(
-                        f"[symbol_select] mode=respect_missing direct={direct} adjust={adjust} use_real_price={use_real_price_flag}"
-                    )
-            # force_data_variant 优先
-            forced = _apply_force_variant(core)
-            if forced:
-                return forced
-            # 生成候选
-            suffix_seq = _candidate_suffix_sequence(use_real_price_flag, adjust)
-            candidates = [core + suf for suf in suffix_seq]
-            chosen = None
-            existence = []
-            for name in candidates:
-                exists = os.path.exists(os.path.join(datadir, name + '.csv'))
-                existence.append(f"{name}:{'Y' if exists else 'N'}")
-                if exists and chosen is None:
-                    chosen = name
-            if not chosen:
-                jq_state['log'].append(f"[symbol_warn] no_candidate_exists core={core} first={candidates[0] if candidates else 'NONE'}")
-                chosen = candidates[0]
-            # strict_real_price 约束：若开启且 use_real_price=True，则必须选中 raw 后缀(_daily/_日)，否则抛错
-            if strict_real_price_flag and use_real_price_flag:
-                raw_ok = any(chosen.endswith(suf) for suf in _SUFFIX_RAW)
-                if not raw_ok:
-                    raise RuntimeError(
-                        f"strict_real_price=True 但选中的数据文件 {chosen}.csv 不是 raw 类型(_daily/_日)。请添加原始未复权数据文件或关闭 strict_real_price。"
-                    )
-            jq_state['log'].append(
-                f"[symbol_select] core={core} adjust={adjust} use_real_price={use_real_price_flag} strict={strict_real_price_flag} respect={respect} candidates={'|'.join(existence)} chosen={chosen}"
-            )
-            return chosen
-
-        def _map_security_code(code: str) -> str:
-            return _select_one(code)
-
-        def _map_benchmark_code(code: str) -> str:
-            # 基准简单：若 respect_symbol_suffix=True 同样生效；否则使用独立优先级：中文日 -> raw -> qfq
-            core, provided_suffix = _normalize_code(code)
-            respect = bool(_opt('respect_symbol_suffix', False))
-            if provided_suffix and respect:
-                direct = core + provided_suffix
-                if os.path.exists(os.path.join(datadir, direct + '.csv')):
-                    return direct
-            bench_seq = ['_日','_daily','_daily_qfq','_daily_hfq']
-            for suf in bench_seq:
-                cand = core + suf
-                if os.path.exists(os.path.join(datadir, cand + '.csv')):
-                    jq_state['log'].append(f"[benchmark_select] core={core} candidates={bench_seq} chosen={cand}")
-                    return cand
-            jq_state['log'].append(f"[benchmark_select_warn] none_exists core={core} fallback={core+bench_seq[0]}")
-            return core + bench_seq[0]
-
+        # 2. 统一标的解析与数据加载 (完全使用 data_loader)
         symbols: List[str] = []
         g_sec = getattr(jq_state.get('g'), 'security', None)
         if g_sec:
-            if isinstance(g_sec, (list, tuple)):
-                symbols = [_map_security_code(s) for s in g_sec if str(s).strip()]
+            if isinstance(g_sec, (list, tuple, set)):
+                symbols = [str(s).strip() for s in g_sec if str(s).strip()]
             elif isinstance(g_sec, str):
-                symbols = [_map_security_code(g_sec)]
+                symbols = [g_sec.strip()]
         if not symbols:
             if isinstance(symbol, str):
                 symbols = [s.strip() for s in symbol.split(',') if s.strip()]
             else:
                 symbols = list(symbol)
-        # 记录原始输入
-        try:
-            jq_state['log'].append(f"[symbol_input] raw={symbols}")
-        except Exception:
-            pass
-        # 若未设置 explicit 尊重后缀，则统一走映射流程（这样前端输入 '000514_daily_qfq' 仍可在 use_real_price/raw 场景下选到 _daily）。
-        respect_suffix = False
-        try:
-            opt = jq_state.get('options', {}).get('respect_symbol_suffix')
-            if isinstance(opt, bool):
-                respect_suffix = opt
-        except Exception:
-            pass
-        mapped_syms: List[str] = []
-        for s in symbols:
-            if respect_suffix:
-                mapped_syms.append(s)
-            else:
-                # 剥后缀重选（允许用户直接传 qfq 仍由 adjust_type 决策）
-                try:
-                    mapped_syms.append(_map_security_code(s))
-                except Exception:
-                    mapped_syms.append(s)
-        symbols = list(dict.fromkeys(mapped_syms))  # 去重保持顺序
-        # use_real_price=True 时强制优先使用未复权(raw)数据文件（若存在），覆盖映射结果（除非用户显式 respect_suffix=True）
-        try:
-            if symbols and not respect_suffix and bool(jq_state.get('options', {}).get('use_real_price', False)):
-                remapped = []
-                detail_lines = []
-                for sym in symbols:
-                    original = sym
-                    core = sym
-                    stripped = False
-                    for suf in ('_daily_qfq','_daily_hfq','_日_qfq','_日_hfq','_daily','_日'):
-                        if core.endswith(suf):
-                            core = core[:-len(suf)]
-                            stripped = True
-                            break
-                    raw_candidates = [core + '_daily', core + '_日']
-                    chosen_raw = None
-                    for rc in raw_candidates:
-                        exists = os.path.exists(os.path.join(datadir, rc + '.csv'))
-                        detail_lines.append(f"candidate={rc} exists={exists}")
-                        if exists and chosen_raw is None:
-                            chosen_raw = rc
-                    remapped.append(chosen_raw or sym)
-                    jq_state['log'].append(
-                        f"[use_real_price_scan] orig={original} stripped={stripped} core={core} raw_found={bool(chosen_raw)} chosen={chosen_raw or sym} details={'|'.join(detail_lines)}"
-                    )
-                symbols = list(dict.fromkeys(remapped))
-                jq_state['log'].append(f"[use_real_price_remap] final_symbols={symbols}")
-        except Exception as _e:
-            try:
-                jq_state['log'].append(f"[use_real_price_remap_error] {type(_e).__name__}:{_e}")
-            except Exception:
-                pass
-        # 记录主 symbol 供后续 blocked 订单引用
-        try:
-            if symbols:
-                jq_state['primary_symbol'] = symbols[0]
-        except Exception:
-            pass
-        try:
-            jq_state['log'].append(f"[symbol_mapped] final={symbols} respect_suffix={respect_suffix}")
-        except Exception:
-            pass
         if not symbols:
             raise ValueError('未指定任何标的: 请在策略 g.security 或 表单 symbol 提供至少一个')
-
-        if benchmark_symbol:
-            benchmark_symbol = _map_benchmark_code(benchmark_symbol)
+        # 规范代码（去掉交易所后缀 / 复权后缀标记）
+        def _base_code(s: str) -> str:
+            c = s.replace('.XSHE','').replace('.XSHG','').replace('.xshe','').replace('.xshg','')
+            # 若带下划线如 000514_daily_qfq 只取数字前缀
+            return re.split(r'[_ ]+', c)[0]
+        base_symbols = list(dict.fromkeys([_base_code(s) for s in symbols]))
+        jq_state['primary_symbol'] = base_symbols[0]
+        jq_state.setdefault('symbol_file_map', {})
+        jq_state['log'].append(f"[symbol_unified] input={symbols} base={base_symbols} freq={frequency} adjust={jq_state['options'].get('adjust_type')}")
+        # 历史预热天数推断 & warmup_start 计算保持原逻辑 (下面代码依赖 lookback_days)
 
         # 读取暖场天数（默认 250，可 set_option('history_lookback_days', N)）
         # 新增：jq_auto_history_preload=True (默认开启) && 用户未显式设置时，
@@ -1781,24 +1506,34 @@ def run_backtest(
         # 建立原始输入代码与映射后文件名的对应关系，便于 attribute_history 精确匹配
         jq_state.setdefault('symbol_file_map', {})
 
-        for i, sym in enumerate(symbols):
-            # 不再无条件覆盖 qfq -> raw；完全由 adjust_type 和 force_data_variant 控制
-            dfeed = load_csv_data(sym, warmup_start, end, datadir)
-            cerebro.adddata(dfeed, name=sym)
-            # 缓存完整历史（用于 attribute_history）
+        final_adjust = jq_state['options'].get('adjust_type', adjust_type)
+        use_real_price_flag = jq_state.get('options', {}).get('use_real_price')
+        for i, base in enumerate(base_symbols):
             try:
-                full_df = load_csv_dataframe(sym, warmup_start, end, datadir)
-                jq_state['history_df_map'][sym] = full_df
+                _path_holder_feed = {}
+                feed = _dl.load_bt_feed(base, warmup_start, end, frequency=frequency, adjust=final_adjust, prefer_stockdata=True,
+                                        use_real_price=use_real_price_flag, out_path_holder=_path_holder_feed)
+                cerebro.adddata(feed, name=base)
+                _path_holder_df = {}
+                full_df = _dl.load_price_dataframe(base, warmup_start, end, frequency=frequency, adjust=final_adjust, prefer_stockdata=True,
+                                                   use_real_price=use_real_price_flag, out_path_holder=_path_holder_df)
+                jq_state['history_df_map'][base] = full_df
                 if i == 0:
                     jq_state['history_df'] = full_df
-                # 记录映射关系与所用数据文件到日志
-                try:
-                    jq_state['symbol_file_map'][symbols[i] if i < len(symbols) else sym] = sym
-                    jq_state['log'].append(f"[data_source] load={sym}.csv")
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                # 记录真实文件路径（feed 与 dataframe 应该一致；优先 dataframe 的记录）
+                sel_path = _path_holder_df.get('path') or _path_holder_feed.get('path')
+                jq_state['symbol_file_map'][base] = sel_path or f"{base}:{frequency}:{final_adjust}"
+                jq_state['log'].append(f"[data_loader] code={base} freq={frequency} adjust={final_adjust} use_real_price={use_real_price_flag} rows={len(full_df)} file={sel_path}")
+            except Exception as _e:
+                jq_state['log'].append(f"[data_loader_error] code={base} err={type(_e).__name__}:{_e}")
+                raise
+        symbols = base_symbols
+        # 处理基准：策略内 set_benchmark 优先于外部参数
+        if jq_state.get('benchmark'):
+            benchmark_symbol = jq_state['benchmark']
+        # 1min 回测暂仍以日线基准 (向用户提示)
+        if benchmark_symbol and frequency == '1min':
+            jq_state['log'].append('[benchmark_notice] 1min 回测暂使用日线基准对齐')
 
         # 3. 处理聚宽 set_option 影响 (commission / slippage / use_real_price)
         strategy_params = strategy_params or {}
@@ -2191,21 +1926,8 @@ def run_backtest(
         lost = trade_ana.get('lost', {}).get('total', 0)
         win_rate = (won / total_trades) if total_trades else 0
 
-        # 推断数据变体（若仅单标的，取第一；多标的则列表）
-        def _infer_variant(name: str) -> str:
-            if any(name.endswith(s) for s in _SUFFIX_QFQ):
-                return 'qfq'
-            if any(name.endswith(s) for s in _SUFFIX_HFQ):
-                return 'hfq'
-            if any(name.endswith(s) for s in _SUFFIX_RAW):
-                return 'raw'
-            return 'unknown'
-        data_variant = None
-        if symbols:
-            if len(symbols) == 1:
-                data_variant = _infer_variant(symbols[0])
-            else:
-                data_variant = {s: _infer_variant(s) for s in symbols}
+        # 简化数据变体：直接使用最终 adjust_type（单标的字符串 / 多标的统一）
+        data_variant = jq_state.get('options', {}).get('adjust_type')
 
         metrics = {
             'final_value': cerebro.broker.getvalue(),
@@ -2240,18 +1962,13 @@ def run_backtest(
         if not benchmark_symbol:
             jq_bm_post = jq_state.get('benchmark') if 'jq_state' in locals() else None
             if jq_bm_post:
-                benchmark_symbol = _map_benchmark_code(jq_bm_post)
+                benchmark_symbol = jq_bm_post
                 metrics['benchmark_detect_phase'] = 'post_run_initialize'
             else:
-                # 默认基准回退: 若无 set_benchmark 且未传入, 尝试使用 000300_日.csv
-                default_bm = '000300_日'
-                default_path = os.path.join(datadir, default_bm + '.csv')
-                if os.path.exists(default_path):
-                    benchmark_symbol = default_bm
-                    metrics['benchmark_detect_phase'] = 'fallback_default'
-                    metrics['benchmark_fallback'] = True
-                else:
-                    metrics['benchmark_fallback'] = False
+                # 默认基准回退: 使用 000300 (日线) 若存在
+                benchmark_symbol = '000300'
+                metrics['benchmark_detect_phase'] = 'fallback_default'
+                metrics['benchmark_fallback'] = True
         else:
             metrics['benchmark_detect_phase'] = 'pre_run_explicit'
 
@@ -2265,7 +1982,11 @@ def run_backtest(
             # 为了与聚宽一致，基准收益以“回测开始日前最后一个可交易日”的收盘为基准
             # 因此这里向前多取几天，之后只在 >= start 的日期上展示，但 equity 的基准点可能在 start 之前
             bench_warmup_start = (pd.to_datetime(start) - pd.Timedelta(days=10)).date().isoformat()
-            bench_df = load_csv_dataframe(benchmark_symbol, bench_warmup_start, end, datadir)
+            bench_freq = frequency if frequency in ('daily','weekly','monthly') else 'daily'
+            try:
+                bench_df = _dl.load_price_dataframe(benchmark_symbol.replace('.XSHG','').replace('.XSHE',''), bench_warmup_start, end, frequency=bench_freq, adjust='auto', prefer_stockdata=True)
+            except Exception:
+                bench_df = pd.DataFrame()
             if len(bench_df) == 0:
                 metrics['benchmark_final'] = None
                 metrics['excess_return'] = None
@@ -2340,13 +2061,9 @@ def run_backtest(
             metrics['benchmark_detect_phase'] = 'none'
         # 回填数据源偏好与实际文件
         try:
-            metrics['data_source_preference'] = jq_state.get('options', {}).get('data_source_preference') or ['_daily', '_daily_qfq', '_日']
+            metrics['data_source_preference'] = jq_state.get('options', {}).get('data_source_preference')
             metrics['data_sources_used'] = jq_state.get('symbol_file_map')
-            # 新结构：由 _decide_adjust() 决定
-            try:
-                metrics['adjust_type'] = _decide_adjust()
-            except Exception:
-                metrics['adjust_type'] = None
+            metrics['adjust_type'] = jq_state.get('options', {}).get('adjust_type')
         except Exception:
             pass
 

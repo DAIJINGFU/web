@@ -54,6 +54,67 @@ datetime,open,high,low,close,volume
 
 日期需为可被 `pd.to_datetime` 识别的字符串。
 
+### （新增）统一数据加载与 `stockdata/` 目录支持
+
+当前版本已将底层数据访问抽象到 `backend/app/data_loader.py`，支持两套目录结构：
+
+1. 旧版：`data/` 平铺文件（仍然兼容）
+2. 新版：`stockdata/stockdata/` 分层目录结构：
+
+- 分钟线：`stockdata/stockdata/1min/sz000001.csv`
+- 多周期：`stockdata/stockdata/1d_1w_1m/<code>/<code>_daily[_qfq|_hfq].csv` 及 `weekly/monthly` 文件
+- 指标：`stockdata/stockdata/indicator/000001.SZ.csv`
+
+回测引擎原先使用的 `load_csv_dataframe` / `load_csv_data` 已重定向到统一加载器，默认优先使用新版目录（存在则用），否则回退旧目录。这样可以逐步迁移数据而不影响历史脚本。
+
+#### 环境变量控制
+
+| 变量                      | 缺省                               | 说明                                                                      |
+| ------------------------- | ---------------------------------- | ------------------------------------------------------------------------- |
+| `PREFER_STOCKDATA`        | `1`                                | 为 `1` 时优先在新版 `stockdata/` 中查找；设为 `0` 强制只用旧 `data/` 目录 |
+| `ADJUST_TYPE`             | `auto`                             | 对应之前的 `adjust_type` 逻辑：`auto/raw/qfq/hfq`                         |
+| `BACKTEST_DATA_ROOT`      | `项目根/data`                      | 指定旧版数据目录根路径                                                    |
+| `BACKTEST_STOCKDATA_ROOT` | 自动探测                           | 指定新版 `stockdata/stockdata` 根路径                                     |
+| `BACKTEST_BENCHMARK_ROOT` | `stockdata/stockdata/基准指数数据` | 指定基准指数数据目录（含 000300\_日.csv 等）；未设时自动扫描该内置目录    |
+
+示例（Windows PowerShell）：
+
+```powershell
+$env:PREFER_STOCKDATA = '1'
+$env:ADJUST_TYPE = 'qfq'
+python scripts/smoke_test.py
+```
+
+#### 直接调用新加载器（可选）
+
+```python
+from backend.app import data_loader as dl
+df = dl.load_price_dataframe('600008.XSHG', '2019-01-01', '2020-01-01', frequency='daily', adjust='auto')
+feed = dl.load_bt_feed('600008.XSHG', '2019-01-01', '2020-01-01')
+```
+
+#### 支持的频率
+
+- `daily` / `weekly` / `monthly` （来自 `1d_1w_1m/<code>/`）
+
+  > 注意：已移除“自动补齐缺失交易日并前值填充”功能，现在只使用数据文件中真实存在的交易日行；如果源数据缺某些本应存在的交易日，该日将完全跳过（不会再出现 gap_fill 标记）。
+
+- `1min` （来自 `1min/`）
+
+> 目前回测主流程仍按日线节奏运行；分钟线接口可用于后续扩展到日内或聚合再回测。
+
+#### 自动列名映射
+
+加载器会统一将中文/变体列映射为：`datetime, open, high, low, close, volume, amount, code`；若缺少 `volume` 会自动补零以满足 backtrader 要求。
+
+#### 代码规范化
+
+输入代码可接受：`600008.XSHG`, `600008`, `000001.SZ` 等形式；内部统一拆分为六位代码 + 交易所，以匹配文件命名（分钟线需根据首位数字猜测交易所时：6=沪，其它=深）。
+
+---
+
+若需要将策略代码层面也暴露“频率”或“复权模式”选择（例如前端新增下拉框），只需在调用 `run_backtest` 前设置对应环境变量或扩展 `run_backtest` 参数并透传到 `data_loader`。
+
 ## 示例策略 (双均线)
 
 ```python
@@ -299,12 +360,12 @@ set_option('force_data_variant', 'qfq')  # 'raw'|'daily'|'qfq'|'hfq'|'日'
 
 ### 2. 语义规则
 
-| adjust_type | use_real_price=True 时候选顺序 | use_real_price=False 时候选顺序 | 说明                                    |
-| ----------- | ------------------------------ | ------------------------------- | --------------------------------------- |
-| raw         | raw > qfq > hfq                | raw > qfq > hfq                 | 始终尽量未复权价撮合                    |
-| qfq         | qfq > raw > hfq                | qfq > raw > hfq                 | 强制前复权优先                          |
-| hfq         | hfq > raw > qfq                | hfq > raw > qfq                 | 强制后复权优先                          |
-| auto (默认) | raw > qfq > hfq                | qfq > raw > hfq                 | 与聚宽约定：真实价 → raw；否则 → 前复权 |
+| adjust_type | use_real_price=True 时候选顺序 | use_real_price=False 时候选顺序 | 说明                                                    |
+| ----------- | ------------------------------ | ------------------------------- | ------------------------------------------------------- |
+| raw         | raw > qfq > hfq                | raw > qfq > hfq                 | 始终尽量未复权价撮合                                    |
+| qfq         | qfq > raw > hfq                | qfq > raw > hfq                 | 强制前复权优先                                          |
+| hfq         | hfq > raw > qfq                | hfq > raw > qfq                 | 强制后复权优先                                          |
+| auto (默认) | raw > qfq > hfq                | qfq > raw > hfq                 | (已实现) use_real_price=True 时优先 raw；否则前复权优先 |
 
 内部会根据英文与中文两套命名族自动扩展：`_daily` 与 `_日` 同层级、`_daily_qfq` 与 `_日_qfq` 同层级，以提升命中率。
 
@@ -316,19 +377,19 @@ set_option('force_data_variant', 'qfq')  # 'raw'|'daily'|'qfq'|'hfq'|'日'
 
 ### 4. 审计日志
 
-运行时日志示例（节选）：
+运行时关键日志（新版）：
 
 ```
-[data_source_scan] adjust_type=auto base=000516 candidates=000516_daily:Y|000516_日:N|000516_daily_qfq:Y|... selected=000516_daily merged_suffixes=_daily|_日|_daily_qfq|_日_qfq|_daily_hfq|_日_hfq
+[data_loader] code=000514 freq=daily adjust=auto use_real_price=True rows=XXXX file=...\000514_daily.csv
 ```
 
 含义：
 
-- base=000516 原始证券代码主干
-- candidates 每个候选文件是否存在 (Y/N)
-- selected 实际选中（首个存在的）
-- merged_suffixes 合成后的后缀优先列表（用于排查顺序逻辑）
-- adjust_type 当前解析到的复权模式
+- code: 标的基础代码
+- freq / adjust: 加载频率与复权模式参数
+- use_real_price: 是否开启真实价优先（影响 auto 排序）
+- rows: 加载后的行数（含预热区间）
+- file: 实际选中的物理 CSV 路径（可直接核对其 close 列）
 
 `metrics` 中会新增：
 
@@ -361,8 +422,8 @@ set_option('adjust_type', 'qfq')   # 或 auto (默认) 也会落在前复权
 
 ### 6. 典型排障步骤
 
-1. 打开日志中 `[data_source_scan]` 行确认是否选对文件。
-2. metrics['data_sources_used'] 确认最终文件名是否含 `_daily` / `_daily_qfq` 与预期一致。
+1. 查找 `[data_loader]` 日志确认 file= 路径是否指向期望的 `_daily` (raw) 或 `_daily_qfq` 文件。
+2. metrics['data_sources_used'] 中查看每个代码的物理路径。
 3. 对比第一笔与第二笔 `[order_value_calc]` 里的 price / comm / leftover 识别差异来源。
 4. 切换 adjust_type = 'raw' 与 'qfq' 回放，验证股数与剩余现金差异是否收敛到预期。
 

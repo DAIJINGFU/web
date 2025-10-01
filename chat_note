@@ -1,0 +1,38 @@
+1.数据接口————————现在通过g.security指定的股票对应数据放在1d_1w_1m文件夹下（日线、周线、月线数据），而分线数据放在1min文件夹下，set_benchmark设定的基准指数数据放在基准指数数据文件夹下，重新检查数据导入选择部分代码，解决错误
+2.数据接口选择错文件了——你这个dataloder相关数据选择代码是不是有问题，有没有可能选择错数据文件了，2000-12-26到2022-12-30的收盘数据不是log日志打印的数据，log日志开头部分内容为：[preparse] detected use_real_price=True in source code
+[exec_mode] fill_price=open cheat_on_open=True
+[limit_check_global] monkeypatch buy/sell installed
+[symbol_input] raw=['000514_daily_qfq']
+[symbol_warn] no_candidate_exists core=000514 first=000514_daily
+[symbol_select] core=000514 adjust=auto use_real_price=True strict=False respect=False candidates=000514_daily:N|000514_日:N|000514_daily_qfq:N|000514_日_qfq:N|000514_daily_hfq:N|000514_日_hfq:N chosen=000514_daily
+[use_real_price_scan] orig=000514_daily stripped=True core=000514 raw_found=False chosen=000514_daily details=candidate=000514_daily exists=False|candidate=000514_日 exists=False
+[use_real_price_remap] final_symbols=['000514_daily']
+[symbol_mapped] final=['000514_daily'] respect_suffix=False
+[auto_history_preload] none_detected use_default=250
+[data_source] load=000514_daily.csv
+[commission_setup] rate=0.0003 model=unified
+[fee_config] min_commission=5.0 stamp_duty=0.001
+[slippage_default] perc=0.00246
+[slippage_mode] scheme=half_slip half=0.00123
+[set_option] use_real_price=True
+[warmup] enter_warmup cur=2022-04-26 start=2023-01-01
+[warmup] leave_warmup cur=2023-01-03 start=2023-01-01
+[exec_mode] run_on_open=True fill_price=open
+2023-01-03 09:30:00 - INFO - close_data             close
+        2022-12-26   4.29
+        2022-12-27   4.26
+        2022-12-28   4.29
+        2022-12-29   4.20
+        2022-12-30   4.26
+2023-01-03 09:30:00 - INFO - MA5 4.26
+2023-01-03 09:30:00 - INFO - current_price 4.26
+2023-01-03 09:30:00 - INFO - cash 100000.0
+[exec_mode] run_on_open=True fill_price=open
+2023-01-04 09:30:00 - INFO - close_data             close
+        2022-12-28   4.29
+        2022-12-29   4.20
+        2022-12-30   4.26
+        2023-01-02   4.26
+        2023-01-03   4.31
+    3.完全移除旧扫描逻辑统一走data_loder，增加一个频率下拉选择，频率选择包括每分、每日、每周、每月，如果选择每日\每周\每月则是在stockdata下的1d_1w_1m查找对应标的，如果选择的是每分则是在1min下寻找对应标的,比如000514.XSHE则是在1d_1w_1m文件夹下找到文件夹名为000514的子文件夹，再在000514的子文件夹内选择是否复权的对应频率的数据文件，大概就是这样的筛选逻辑，我漏掉的你帮我补充，基于此修改优化代码
+    4.
