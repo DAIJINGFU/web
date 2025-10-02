@@ -145,15 +145,36 @@ def resolve_price_file(symbol: str,
     if prefer_stockdata and os.path.isdir(stockdata_root):
     # 新版 stockdata 目录结构
         if freq == '1min':
+            # 1min 也与日/周/月保持一致的“选择顺序”语义；允许存在 *_qfq / *_hfq 扩展文件
             if not ex:
-                # 推断交易所：代码首位为 6 视为沪市，否则视为深市（仅在未显式提供时）
                 ex = 'SH' if code.startswith('6') else 'SZ'
             prefix = _minute_prefix.get(ex, ex.lower())
-            fname = f"{prefix}{code}.csv"  # 例: sz000001.csv
-            path = os.path.join(stockdata_root, '1min', fname)
-            if not os.path.exists(path):
-                raise DataNotFound(f"分钟数据缺失: {path}")
-            return path
+            base = f"{prefix}{code}"
+            # 生成候选序列
+            if adjust == 'raw':
+                seq = [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
+            elif adjust == 'qfq':
+                seq = [base + '_qfq.csv', base + '.csv', base + '_hfq.csv']
+            elif adjust == 'hfq':
+                seq = [base + '_hfq.csv', base + '.csv', base + '_qfq.csv']
+            else:  # auto
+                if use_real_price:
+                    seq = [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
+                else:
+                    seq = [base + '_qfq.csv', base + '.csv', base + '_hfq.csv']
+            tried = []
+            for fname in seq:
+                path = os.path.join(stockdata_root, '1min', fname)
+                tried.append(path)
+                if os.path.exists(path):
+                    return path
+            # 兜底扫描（防止未来出现其它命名）
+            minute_dir = os.path.join(stockdata_root, '1min')
+            if os.path.isdir(minute_dir):
+                for f in os.listdir(minute_dir):
+                    if f.startswith(base):
+                        return os.path.join(minute_dir, f)
+            raise DataNotFound(f"分钟数据缺失: base={base} tried={tried}")
         elif freq in ('daily','weekly','monthly'):
             subdir = os.path.join(stockdata_root, '1d_1w_1m', code)
             if not os.path.isdir(subdir):
@@ -229,7 +250,17 @@ def _read_csv(path: str) -> pd.DataFrame:
                 break
     if 'datetime' not in df.columns:
         raise ValueError(f"文件缺少日期列: {path}")
-    df['datetime'] = pd.to_datetime(df['datetime'])
+    df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    # 兼容含时区的数据：统一去除时区，内部使用本地 naive 时间
+    try:
+        if hasattr(df['datetime'].dt, 'tz') and df['datetime'].dt.tz is not None:
+            df['datetime'] = df['datetime'].dt.tz_convert(None)
+    except Exception:
+        try:
+            # 某些版本 pandas 需要 tz_localize(None)
+            df['datetime'] = df['datetime'].dt.tz_localize(None)
+        except Exception:
+            pass
     df = df.sort_values('datetime').reset_index(drop=True)
     return df
 

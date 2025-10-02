@@ -1351,9 +1351,13 @@ def run_backtest(
         try:
             # 仅当尚未显式设置 use_real_price 时才尝试推断
             if 'use_real_price' not in jq_state.get('options', {}):
-                if re.search(r"set_option\(\s*['\"]use_real_price['\"]\s*,\s*True", strategy_code):
-                    jq_state['options']['use_real_price'] = True
-                    jq_state['log'].append('[preparse] detected use_real_price=True in source code')
+                # 更宽松的匹配：True / true / 1 / False / false / 0
+                m_use = re.search(r"set_option\(\s*['\"]use_real_price['\"]\s*,\s*(True|False|true|false|1|0)\s*\)", strategy_code)
+                if m_use:
+                    raw_val = m_use.group(1)
+                    val = True if raw_val in ('True','true','1') else False
+                    jq_state['options']['use_real_price'] = val
+                    jq_state['log'].append(f"[preparse] detected use_real_price={val} (token={raw_val}) in source code")
             # adjust_type 同理（只解析 raw/qfq/hfq/auto 简单字面值）
             if 'adjust_type' not in jq_state.get('options', {}):
                 m_adj = re.search(r"set_option\(\s*['\"]adjust_type['\"]\s*,\s*['\"](raw|qfq|hfq|auto)['\"]", strategy_code, re.IGNORECASE)
