@@ -372,6 +372,28 @@
       <input id="start" type="date" value="2025-01-01" />
       <label>结束日期</label>
       <input id="end" type="date" value="2025-03-01" />
+      <label>回测频率</label>
+      <select
+        id="frequency"
+        style="
+          background: var(--panel);
+          border: 1px solid var(--border);
+          color: var(--text);
+          width: 100%;
+          padding: 8px 10px;
+          border-radius: 6px;
+          font-size: 13px;
+        "
+      >
+        <option value="daily" selected>日线 (daily)</option>
+        <option value="weekly">周线 (weekly)</option>
+        <option value="monthly">月线 (monthly)</option>
+        <option value="1min">1分钟 (1min, 基准仍用日线)</option>
+      </select>
+      <small class="helper"
+        >周/月线会优先加载已有聚合文件；缺失时自动由日线聚合。1分钟目前基准/聚宽
+        history 仍按日线处理。</small
+      >
       <label>解析到的基准 (来自 set_benchmark)</label>
       <div
         id="parsedBenchmark"
@@ -642,6 +664,7 @@ class UserStrategy(bt.Strategy):
           cash: parseFloat(document.getElementById("cash").value),
           strategy_code: code,
           benchmark_symbol: null, // 交由后端自动解析 set_benchmark
+          frequency: document.getElementById("frequency").value,
         };
         if (!extracted.length) {
           // 给用户提示仍可兼容旧写法

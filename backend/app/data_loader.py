@@ -167,16 +167,33 @@ def resolve_price_file(symbol: str,
             else:
                 # 周 / 月线命名模式: code_weekly[_qfq].csv / code_monthly_hfq.csv 等
                 base = f"{code}_{'weekly' if freq=='weekly' else 'monthly'}"
-                seq = [base + s for s in (['_qfq.csv','_hfq.csv','.csv'] if adjust=='qfq' else ['.csv','_qfq.csv','_hfq.csv'])]
+                # 针对日/周/月聚合文件，实际命名可能只存在一个 base.csv 或 base_qfq.csv 或 base_hfq.csv
+                # 这里根据 adjust 模式生成更宽松、且包含 auto 情况的候选顺序：
+                if adjust == 'qfq':
+                    seq = [base + '_qfq.csv', base + '_hfq.csv', base + '.csv']
+                elif adjust == 'hfq':
+                    seq = [base + '_hfq.csv', base + '_qfq.csv', base + '.csv']
+                elif adjust == 'raw':  # raw 优先非复权
+                    seq = [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
+                else:  # auto: 需要与日线保持一致，并结合 use_real_price
+                    if use_real_price:
+                        # 真实价优先 raw > qfq > hfq
+                        seq = [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
+                    else:
+                        # 默认前复权优先 qfq > raw > hfq
+                        seq = [base + '_qfq.csv', base + '.csv', base + '_hfq.csv']
+                tried = []
                 for fname in seq:
                     p = os.path.join(subdir, fname)
+                    tried.append(p)
                     if os.path.exists(p):
                         return p
                 # 兜底：扫描目录中任意以 base 前缀开头的文件
                 for f in os.listdir(subdir):
                     if f.startswith(base):
                         return os.path.join(subdir, f)
-                raise DataNotFound(f"未找到{freq}文件: {subdir}")
+                # 最终仍未找到，抛出并附带尝试路径方便排查
+                raise DataNotFound(f"未找到{freq}文件: {subdir}; tried={tried}")
         else:
             raise ValueError(f"不支持频率: {frequency}")
     # 旧目录或回退逻辑
@@ -186,8 +203,8 @@ def resolve_price_file(symbol: str,
 
 
 def _resolve_legacy_daily(code: str, adjust: str, data_root: str) -> str:
-    # 扫描候选文件列表
-    for fname in _candidate_daily_files(code, adjust, use_real_price):
+    # 扫描候选文件列表（旧目录没有 use_real_price 语义，直接按 adjust 顺序）
+    for fname in _candidate_daily_files(code, adjust, use_real_price=None):
         path = os.path.join(data_root, fname)
         if os.path.exists(path):
             return path
