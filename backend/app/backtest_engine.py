@@ -171,6 +171,7 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         # 运行辅助状态
         'history_df': None,      # 单标的完整历史（DataFrame，含 datetime 列）
         'history_df_map': {},    # 多标的缓存
+    'minute_daily_cache': {}, # 分钟级 -> 日级聚合缓存 {symbol: aggregated_daily_df}
         'current_dt': None,      # 当前 bar 展示时间（字符串）
         'user_start': None,      # 用户选择的开始日期（YYYY-MM-DD）
         'in_warmup': False,      # 暖场阶段（< user_start）
@@ -470,6 +471,48 @@ def compile_user_strategy(code: str):
                                 continue
                             df = df_full[['datetime'] + [c for c in ['open','close','high','low','volume'] if c in df_full.columns]].copy()
                             df['date'] = df['datetime'].dt.date
+                            # 若源数据为分钟级（同一 date 多行）且当前仅支持日级查询，则聚合为日线
+                            try:
+                                if df['date'].nunique() < len(df):  # 存在重复日期 => 可能是分钟/更细粒度
+                                    # 使用缓存：首次对该 symbol 聚合后保存，后续直接复用
+                                    cache = jq_state.setdefault('minute_daily_cache', {})
+                                    cache_key = base
+                                    cached_daily = cache.get(cache_key)
+                                    if cached_daily is None:
+                                        # 聚合规则：open=第一条，close=最后一条，high=max，low=min，volume=sum
+                                        agg_cols = {}
+                                        for col in ['open','close','high','low','volume']:
+                                            if col in df.columns:
+                                                if col == 'open':
+                                                    agg_cols[col] = 'first'
+                                                elif col == 'close':
+                                                    agg_cols[col] = 'last'
+                                                elif col == 'high':
+                                                    agg_cols[col] = 'max'
+                                                elif col == 'low':
+                                                    agg_cols[col] = 'min'
+                                                elif col == 'volume':
+                                                    agg_cols[col] = 'sum'
+                                        gdf = df.groupby('date').agg(agg_cols).reset_index()
+                                        import pandas as _pd
+                                        gdf['datetime'] = _pd.to_datetime(gdf['date'])
+                                        ordered_cols = ['datetime','open','high','low','close','volume']
+                                        gdf = gdf[[c for c in ordered_cols if c in gdf.columns]]
+                                        gdf['date'] = gdf['datetime'].dt.date
+                                        cache[cache_key] = gdf  # 存缓存
+                                        try:
+                                            if not jq_state.get('_minute_source_aggregated_logged'):
+                                                jq_state['_minute_source_aggregated_logged'] = True
+                                                jq_state['log'].append(f"[minute_source_aggregate] detected minute-level history -> aggregated to daily for get_price/attribute_history")
+                                            jq_state['log'].append(f"[minute_daily_cache] build sec={cache_key} rows={len(gdf)}")
+                                        except Exception:
+                                            pass
+                                        df = gdf.copy()
+                                    else:
+                                        # 直接复用缓存（复制避免下游修改）
+                                        df = cached_daily.copy()
+                            except Exception:
+                                pass
                             # 过滤未来：只取 < 当前回测日 的历史
                             if cur_bt_date is not None:
                                 df = df[df['date'] < cur_bt_date]
