@@ -1,0 +1,12 @@
+{
+  "benchmark_return": -0.11378153387591394,
+  "data_variant": "auto",
+  "equity_hash": "f187fc9f638873b666b7c28a853aab25",
+  "excess_return": 0.3880733239288632,
+  "final_value": 123013.62119999998,
+  "max_drawdown": 18.88271251793356,
+  "pnl_pct": 0.2301362119999999,
+  "total_trades": 2,
+  "use_real_price": true,
+  "win_rate": 0.5
+}
