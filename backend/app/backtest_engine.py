@@ -14,6 +14,8 @@ import pandas as pd
 from .corporate_actions import load_corporate_actions, apply_event
 # 新增统一数据加载接口
 from . import data_loader as _dl
+# 新增股票池模块
+from . import stock_pool
 
 
 def _round_to_tick(value: float, tick: float) -> float:
@@ -124,6 +126,12 @@ ALLOWED_GLOBALS = {
     },
     'bt': bt,
     'pd': pd,
+    # 股票池模块函数（聚宽兼容）
+    'get_index_stocks': stock_pool.get_index_stocks,
+    'get_index_weights': stock_pool.get_index_weights,
+    'get_industry_stocks': stock_pool.get_industry_stocks,
+    'get_concept_stocks': stock_pool.get_concept_stocks,
+    'get_all_securities': stock_pool.get_all_securities,
 }
 
 # 允许的安全导入白名单
@@ -291,6 +299,12 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         'order_value': order_value,
         'order_target': order_target,
         'jq_state': jq_state,
+        # 股票池函数（聚宽兼容）
+        'get_index_stocks': stock_pool.get_index_stocks,
+        'get_index_weights': stock_pool.get_index_weights,
+        'get_industry_stocks': stock_pool.get_industry_stocks,
+        'get_concept_stocks': stock_pool.get_concept_stocks,
+        'get_all_securities': stock_pool.get_all_securities,
     })
     return jq_state
 
@@ -311,6 +325,13 @@ def compile_user_strategy(code: str):
     module = types.ModuleType('user_module')
     exec_env = dict(ALLOWED_GLOBALS)  # 复制
     jq_state = _build_jq_compat_env(exec_env)
+    
+    # 关键修复：将 exec_env 的内容合并到 module.__dict__ 中
+    # 这样 initialize 和 handle_data 函数就能访问股票池函数了
+    for key, value in exec_env.items():
+        if key not in module.__dict__:
+            module.__dict__[key] = value
+    
     exec(code, exec_env, module.__dict__)
 
     # 模式1: 直接存在 UserStrategy
