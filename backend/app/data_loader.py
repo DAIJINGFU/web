@@ -145,36 +145,49 @@ def resolve_price_file(symbol: str,
     if prefer_stockdata and os.path.isdir(stockdata_root):
     # 新版 stockdata 目录结构
         if freq == '1min':
-            # 1min 也与日/周/月保持一致的“选择顺序”语义；允许存在 *_qfq / *_hfq 扩展文件
+            # --- 分钟线命名兼容说明 ---
+            #  为了兼容历史与新采集两种风格：
+            #   1) 旧: sh600025.csv / sz000001_qfq.csv
+            #   2) 新: 600025.SH.csv / 000001.SZ_qfq.csv
+            #  这里的策略：优先按“新风格” code.EX[_{qfq|hfq}].csv 搜索；若不存在再尝试旧前缀式。
+            #  调用方可以继续传入 600025.SH 或 600025.XSHG / 600025 皆可（normalize_symbol 会补充交易所）。
+            # --------------------------------
+            # 分钟线文件命名兼容：
+            #  旧版: sh600025.csv / sz000001_qfq.csv
+            #  新版: 600025.SH.csv / 000001.SZ_qfq.csv
+            # 规则：优先尝试新版 (code.EX) 命名，再回退旧前缀式 (sh|sz+code)
             if not ex:
                 ex = 'SH' if code.startswith('6') else 'SZ'
             prefix = _minute_prefix.get(ex, ex.lower())
-            base = f"{prefix}{code}"
-            # 生成候选序列
-            if adjust == 'raw':
-                seq = [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
-            elif adjust == 'qfq':
-                seq = [base + '_qfq.csv', base + '.csv', base + '_hfq.csv']
-            elif adjust == 'hfq':
-                seq = [base + '_hfq.csv', base + '.csv', base + '_qfq.csv']
-            else:  # auto
+            base_old = f"{prefix}{code}"      # sh600025
+            base_new = f"{code}.{ex}"          # 600025.SH
+
+            def _minute_name_candidates(base: str) -> List[str]:
+                if adjust == 'raw':
+                    return [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
+                if adjust == 'qfq':
+                    return [base + '_qfq.csv', base + '.csv', base + '_hfq.csv']
+                if adjust == 'hfq':
+                    return [base + '_hfq.csv', base + '.csv', base + '_qfq.csv']
+                # auto
                 if use_real_price:
-                    seq = [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
-                else:
-                    seq = [base + '_qfq.csv', base + '.csv', base + '_hfq.csv']
-            tried = []
-            for fname in seq:
-                path = os.path.join(stockdata_root, '1min', fname)
+                    return [base + '.csv', base + '_qfq.csv', base + '_hfq.csv']
+                return [base + '_qfq.csv', base + '.csv', base + '_hfq.csv']
+
+            minute_dir = os.path.join(stockdata_root, '1min')
+            tried: List[str] = []
+            # 组合候选：新版优先，其次旧版
+            for fname in _minute_name_candidates(base_new) + _minute_name_candidates(base_old):
+                path = os.path.join(minute_dir, fname)
                 tried.append(path)
                 if os.path.exists(path):
                     return path
-            # 兜底扫描（防止未来出现其它命名）
-            minute_dir = os.path.join(stockdata_root, '1min')
+            # 兜底扫描：查找任何前缀匹配 (新版/旧版) 的文件
             if os.path.isdir(minute_dir):
                 for f in os.listdir(minute_dir):
-                    if f.startswith(base):
+                    if f.startswith(base_new) or f.startswith(base_old):
                         return os.path.join(minute_dir, f)
-            raise DataNotFound(f"分钟数据缺失: base={base} tried={tried}")
+            raise DataNotFound(f"分钟数据缺失: code={code} ex={ex} tried={tried}")
         elif freq in ('daily','weekly','monthly'):
             subdir = os.path.join(stockdata_root, '1d_1w_1m', code)
             if not os.path.isdir(subdir):
