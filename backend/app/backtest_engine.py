@@ -94,8 +94,19 @@ class BacktestResult:
     trades: List[TradeRecord]
     log: str
     orders: List[OrderRecord] | None = None
+    blocked_orders: List[OrderRecord] | None = None  # 新增：被阻止的订单
     jq_records: List[Dict[str, Any]] | None = None
     jq_logs: List[str] | None = None
+    
+    @property
+    def final_value(self) -> float:
+        """最终净值"""
+        return self.metrics.get('final_value', 0.0)
+    
+    @property
+    def total_return(self) -> float:
+        """总收益率"""
+        return self.metrics.get('total_return', 0.0)
 
 # -----------------------------
 # 策略动态加载
@@ -282,6 +293,9 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
     def attribute_history(security: str, n: int, unit: str, fields: List[str]):
         raise RuntimeError('attribute_history 仅在聚宽兼容包装策略中可用')
 
+    def order(security: str, amount: int):
+        raise RuntimeError('order 仅在聚宽兼容包装策略中可用')
+
     def order_value(security: str, value: float):
         raise RuntimeError('order_value 仅在聚宽兼容包装策略中可用')
 
@@ -296,6 +310,7 @@ def _build_jq_compat_env(target_dict: Dict[str, Any]):
         'record': record,
         'log': log_obj,
         'attribute_history': attribute_history,
+        'order': order,
         'order_value': order_value,
         'order_target': order_target,
         'jq_state': jq_state,
@@ -354,12 +369,34 @@ def compile_user_strategy(code: str):
                     @property
                     def positions(inner_self):
                         # 返回 dict-like; 仅支持单标的
+                        # T+1制度：计算可卖数量 = 总持仓 - 当日买入数量
+                        total_amount = int(self.position.size)
+                        current_date = jq_state.get('current_dt', '').split(' ')[0]
+                        today_bought = jq_state.get('_daily_bought', {}).get(current_date, 0)
+                        closeable = max(0, total_amount - today_bought)
+                        
                         return {getattr(jq_state['g'], 'security', 'data0'): types.SimpleNamespace(
-                            closeable_amount=int(self.position.size)
+                            closeable_amount=closeable,
+                            total_amount=total_amount
                         )}
 
                 class _Context:
                     portfolio = _Portfolio()
+                    
+                    @property
+                    def current_dt(inner_self):
+                        """返回当前日期时间对象"""
+                        try:
+                            import datetime as dt_module
+                            current_dt_str = jq_state.get('current_dt', '')
+                            if current_dt_str:
+                                # current_dt 格式为 "YYYY-MM-DD HH:MM:SS"
+                                return dt_module.datetime.strptime(current_dt_str, '%Y-%m-%d %H:%M:%S')
+                            else:
+                                # 回退到当前bar的时间
+                                return bt.num2date(self.data.datetime[0])
+                        except Exception:
+                            return bt.num2date(self.data.datetime[0])
 
                 self._jq_context = _Context()
                 # 绑定执行环境引用，供 _run_handle / next_open / next 使用
@@ -1276,9 +1313,48 @@ def compile_user_strategy(code: str):
                         except Exception:
                             pass
                     # end order_target
+                
+                def order(security: str, amount: int):
+                    """
+                    聚宽风格的下单函数（按股数下单）
+                    
+                    Args:
+                        security: 股票代码
+                        amount: 股数（正数买入，负数卖出）
+                    
+                    Returns:
+                        Order对象或None
+                    """
+                    try:
+                        # 获取当前价格
+                        data = self.data
+                        fillp = str(exec_env.get('jq_state', {}).get('options', {}).get('fill_price', 'open')).lower()
+                        price = float(getattr(data, 'close')[0]) if fillp == 'close' else float(getattr(data, 'open')[0]) if hasattr(data, 'open') else float(getattr(data, 'close')[0])
+                        
+                        # 计算金额
+                        value = abs(amount) * price
+                        
+                        # 买入或卖出
+                        if amount > 0:
+                            # 买入：使用 order_value 逻辑
+                            return order_value(security, value)
+                        elif amount < 0:
+                            # 卖出：使用 order_value 逻辑（负值）
+                            return order_value(security, -value)
+                        else:
+                            return None
+                    except Exception as _e:
+                        try:
+                            exec_env['log'].info(f"[order_error] {type(_e).__name__}:{_e}")
+                        except Exception:
+                            pass
+                        return None
+                    # end order
+                
                 # 暴露函数到执行环境（供用户脚本中的全局方法调用）
                 try:
                     exec_env['attribute_history'] = attribute_history
+                    exec_env['order'] = order
                     exec_env['order_value'] = order_value
                     exec_env['order_target'] = order_target
                 except Exception:
@@ -1357,6 +1433,19 @@ def compile_user_strategy(code: str):
                         cur_date_obj = bt.num2date(self.data.datetime[0]).date()
                         cur_dt = cur_date_obj.isoformat()
                         jq_state['current_dt'] = f"{cur_dt} 09:30:00"
+                        
+                        # T+1制度：清理过期的买入记录（保留最近2天，避免日期跳跃问题）
+                        if '_daily_bought' in jq_state:
+                            try:
+                                from datetime import datetime, timedelta
+                                current_date_obj = datetime.strptime(cur_dt, '%Y-%m-%d')
+                                cutoff_date = (current_date_obj - timedelta(days=2)).strftime('%Y-%m-%d')
+                                keys_to_delete = [k for k in jq_state['_daily_bought'].keys() if k < cutoff_date]
+                                for k in keys_to_delete:
+                                    del jq_state['_daily_bought'][k]
+                            except Exception:
+                                pass
+                        
                         user_start = jq_state.get('user_start')
                         in_warmup_before = jq_state.get('in_warmup')
                         if isinstance(user_start, str):
@@ -1392,6 +1481,69 @@ def compile_user_strategy(code: str):
         # -----------------------------
         # 回测执行
         # -----------------------------
+
+def _is_stock_paused(stock_code: str, check_date: str, jq_state: dict) -> bool:
+    """
+    检查股票在指定日期是否停牌
+    
+    Args:
+        stock_code: 股票代码（如 000001.SZ）
+        check_date: 检查日期（格式：YYYY-MM-DD）
+        jq_state: 状态字典
+    
+    Returns:
+        True 如果停牌，False 如果正常交易
+    """
+    try:
+        import pandas as pd
+        from pathlib import Path
+        
+        # 规范化股票代码
+        base_code = stock_code.replace('.XSHE', '.SZ').replace('.XSHG', '.SH')
+        base_code = base_code.replace('.xshe', '.SZ').replace('.xshg', '.SH')
+        
+        # 尝试多个可能的路径
+        data_root = Path(jq_state.get('options', {}).get('datadir', 'stockdata/stockdata'))
+        possible_paths = [
+            data_root / '停牌数据' / f"{base_code}.csv",
+            data_root / 'pause_data' / f"{base_code}.csv",
+            data_root / '停牌数据' / f"{base_code.split('.')[0]}.csv",
+        ]
+        
+        for pause_file in possible_paths:
+            if pause_file.exists():
+                df = pd.read_csv(pause_file)
+                
+                # 支持多种列名格式
+                date_cols = [c for c in df.columns if '日期' in c or 'date' in c.lower()]
+                start_cols = [c for c in df.columns if '开始' in c or 'start' in c.lower()]
+                end_cols = [c for c in df.columns if '结束' in c or 'end' in c.lower()]
+                
+                if not (start_cols and end_cols):
+                    continue
+                
+                start_col = start_cols[0]
+                end_col = end_cols[0]
+                
+                # 检查日期是否在停牌区间内
+                for _, row in df.iterrows():
+                    start_date = str(row[start_col])[:10]
+                    end_date = str(row[end_col])[:10]
+                    if start_date <= check_date <= end_date:
+                        jq_state['log'].append(f"[pause_check] {stock_code} paused: {start_date} to {end_date}")
+                        return True
+                
+                return False
+        
+        # 没有停牌数据文件，假设未停牌
+        return False
+        
+    except Exception as e:
+        # 发生错误时假设未停牌，避免阻止交易
+        jq_state['log'].append(f"[pause_check] Error checking pause status: {e}")
+        return False
+
+
 def run_backtest(
     symbol: str,
     start: str,
@@ -1459,6 +1611,17 @@ def run_backtest(
                             if jq_state.get('in_warmup'):
                                 return None
                             data = strategy_self.data
+                            
+                            # T+1检查：获取当前持仓和可卖数量（虽然买入不需要，但为保持一致性）
+                            current_date = jq_state.get('current_dt', '').split(' ')[0]
+                            
+                            # 停牌检查
+                            stock_code = getattr(jq_state.get('g'), 'security', None) or 'data0'
+                            if _is_stock_paused(stock_code, current_date, jq_state):
+                                jq_state['log'].append(f"[pause_check] BLOCK BUY {stock_code} paused on {current_date}")
+                                jq_state['blocked_orders'].append(OrderRecord(datetime=current_date, symbol=stock_code, side='BUY', size=0, price=0.0, value=0.0, commission=0.0, status='BlockedPaused'))
+                                return None
+                            
                             fillp = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
                             cur_price = float(getattr(data, 'close')[0]) if fillp == 'close' else float(getattr(data, 'open')[0]) if hasattr(data,'open') else float(getattr(data,'close')[0])
                             try:
@@ -1479,6 +1642,32 @@ def run_backtest(
                             if jq_state.get('in_warmup'):
                                 return None
                             data = strategy_self.data
+                            
+                            # T+1检查：当日买入的不能卖出
+                            current_date = jq_state.get('current_dt', '').split(' ')[0]
+                            stock_code = getattr(jq_state.get('g'), 'security', None) or 'data0'
+                            
+                            # 停牌检查
+                            if _is_stock_paused(stock_code, current_date, jq_state):
+                                jq_state['log'].append(f"[pause_check] BLOCK SELL {stock_code} paused on {current_date}")
+                                jq_state['blocked_orders'].append(OrderRecord(datetime=current_date, symbol=stock_code, side='SELL', size=0, price=0.0, value=0.0, commission=0.0, status='BlockedPaused'))
+                                return None
+                            
+                            # T+1检查：获取可卖数量
+                            total_position = int(strategy_self.position.size)
+                            today_bought = jq_state.get('_daily_bought', {}).get(current_date, 0)
+                            closeable = max(0, total_position - today_bought)
+                            
+                            # 检查卖出数量
+                            size = kw.get('size') if 'size' in kw else (a[0] if len(a) > 0 else None)
+                            if size is None:
+                                size = total_position  # 默认全部卖出
+                            
+                            if size > closeable:
+                                jq_state['log'].append(f"[T+1_check] BLOCK SELL {stock_code} size={size} > closeable={closeable} (total={total_position}, today_bought={today_bought})")
+                                jq_state['blocked_orders'].append(OrderRecord(datetime=current_date, symbol=stock_code, side='SELL', size=size, price=0.0, value=0.0, commission=0.0, status='BlockedT+1'))
+                                return None
+                            
                             fillp = str(jq_state.get('options', {}).get('fill_price', 'open')).lower()
                             cur_price = float(getattr(data, 'close')[0]) if fillp == 'close' else float(getattr(data, 'open')[0]) if hasattr(data,'open') else float(getattr(data,'close')[0])
                             try:
@@ -1845,6 +2034,17 @@ def run_backtest(
                 # 推断多空方向（正为买，负为卖）
                 size = getattr(order.executed, 'size', 0.0)
                 price = getattr(order.executed, 'price', 0.0)
+                
+                # T+1制度：记录当日买入数量
+                if order.status == order.Completed and size > 0:  # 买入
+                    current_date = dt or jq_state.get('current_dt', '').split(' ')[0]
+                    if '_daily_bought' not in jq_state:
+                        jq_state['_daily_bought'] = {}
+                    if current_date not in jq_state['_daily_bought']:
+                        jq_state['_daily_bought'][current_date] = 0
+                    jq_state['_daily_bought'][current_date] += abs(size)
+                    jq_state['log'].append(f"[T+1_track] {current_date} bought {abs(size)} shares, total today: {jq_state['_daily_bought'][current_date]}")
+                
                 # Backtrader 的 order.executed.value 可能是根据价差/方向等内部逻辑计算的净值，
                 # 为确保与聚宽风格一致，这里强制使用 size * price 作为成交金额（方向性金额）。
                 orig_value = getattr(order.executed, 'value', 0.0)
@@ -2389,6 +2589,14 @@ def run_backtest(
             jq_logs = list(jq_state.get('log', []))
         except Exception:
             jq_logs = []
+        
+        # 提取被阻止的订单
+        blocked_orders = None
+        try:
+            blocked_orders = list(jq_state.get('blocked_orders', []))
+        except Exception:
+            blocked_orders = []
+        
         return BacktestResult(
             metrics=metrics,
             equity_curve=equity_curve,
@@ -2399,6 +2607,7 @@ def run_backtest(
             excess_curve=excess_curve,
             trades=trades,
             orders=orders,
+            blocked_orders=blocked_orders,
             log=log_buffer.getvalue(),
             jq_records=jq_records,
             jq_logs=jq_logs,
@@ -2414,6 +2623,7 @@ def run_backtest(
             benchmark_curve=[],
             excess_curve=[],
             trades=[],
+            blocked_orders=[],
             log=tb,
             jq_records=None,
             jq_logs=None,
