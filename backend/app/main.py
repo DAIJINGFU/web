@@ -1,3 +1,5 @@
+"""FastAPI 服务入口：提供本地回测接口与静态页面托管。"""
+
 from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles

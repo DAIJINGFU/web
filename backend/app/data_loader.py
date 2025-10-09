@@ -69,7 +69,7 @@ def normalize_symbol(symbol: str) -> Tuple[str, Optional[str]]:
     s = s.replace('.xshg', '.XSHG').replace('.xshe', '.XSHE')
     m = _symbol_ex_pattern.match(s)
     if not m:
-    # 尝试剥离诸如 _daily_qfq 等后缀得到核心代码
+        # 尝试剥离诸如 _daily_qfq 等后缀得到核心代码，确保能够识别旧文件名中的代码部分
         core = re.sub(r"[_\.].*$", "", s)
         if len(core) == 6 and core.isdigit():
             return core, None
@@ -151,6 +151,7 @@ def resolve_price_file(symbol: str,
             #   2) 新: 600025.SH.csv / 000001.SZ_qfq.csv
             #  这里的策略：优先按“新风格” code.EX[_{qfq|hfq}].csv 搜索；若不存在再尝试旧前缀式。
             #  调用方可以继续传入 600025.SH 或 600025.XSHG / 600025 皆可（normalize_symbol 会补充交易所）。
+            # 额外说明：部分历史数据采集脚本可能将交易所写为小写，normalize_symbol 已统一大小写以降低歧义。
             # --------------------------------
             # 分钟线文件命名兼容：
             #  旧版: sh600025.csv / sz000001_qfq.csv
